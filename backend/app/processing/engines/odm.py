@@ -18,12 +18,15 @@ import shutil
 import subprocess
 import time
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 
 from ...config import settings
 from .base import EngineContext, EngineResult, EngineUnavailable
 
 # Trechos do log do ODM -> (etapa da UI, fração aproximada da etapa)
+_DAEMON_CHECKED_AT = 0.0
+
 ODM_STAGE_PATTERNS: list[tuple[re.Pattern[str], int, float]] = [
     (re.compile(r"running dataset stage", re.I), 1, 0.5),
     (re.compile(r"loading dataset|found \d+ usable images", re.I), 2, 0.5),
@@ -35,6 +38,27 @@ ODM_STAGE_PATTERNS: list[tuple[re.Pattern[str], int, float]] = [
     (re.compile(r"running odm_orthophoto|orthophoto", re.I), 7, 0.5),
     (re.compile(r"running odm_report|compressing|post processing", re.I), 8, 0.5),
 ]
+
+
+@lru_cache(maxsize=1)
+def _docker_daemon_probe() -> bool:
+    try:
+        return subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, timeout=8,
+        ).returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def _docker_daemon_running(ttl: float = 30.0) -> bool:
+    """Resultado em cache: `docker info` custa caro para chamar a cada request."""
+    global _DAEMON_CHECKED_AT
+    now = time.monotonic()
+    if now - _DAEMON_CHECKED_AT > ttl:
+        _docker_daemon_probe.cache_clear()
+        _DAEMON_CHECKED_AT = now
+    return _docker_daemon_probe()
 
 
 def _map_progress(line: str) -> tuple[int, float] | None:
@@ -52,9 +76,13 @@ class ODMEngine:
     def availability(self) -> tuple[bool, str]:
         if settings.nodeodm_url:
             return True, f"NodeODM em {settings.nodeodm_url}"
-        if shutil.which("docker"):
-            return True, f"Docker local ({settings.odm_docker_image})"
-        return False, "requer Docker instalado ou ORTO_NODEODM_URL configurado"
+        if not shutil.which("docker"):
+            return False, "requer Docker instalado ou ORTO_NODEODM_URL configurado"
+        # O binário do docker existir não basta: sem daemon acessível o job
+        # falharia só depois de enfileirado.
+        if not _docker_daemon_running():
+            return False, "o daemon do Docker não está acessível"
+        return True, f"Docker local ({settings.odm_docker_image})"
 
     def run(self, ctx: EngineContext) -> EngineResult:
         available, reason = self.availability()
