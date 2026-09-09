@@ -70,7 +70,13 @@ def dashboard_stats(db: Session = Depends(get_db)) -> dict:
     projects = db.scalars(select(Project)).all()
     processing = [p for p in projects if p.status == ProjectStatus.PROCESSING]
     completed = [p for p in projects if p.status == ProjectStatus.COMPLETED]
-    total_images = db.scalar(select(func.count(Image.id))) or 0
+    # Conta apenas o que entra no processamento: sem arquivos inválidos nem
+    # duplicatas, para bater com o número mostrado em cada projeto.
+    total_images = db.scalar(
+        select(func.count(Image.id)).where(
+            Image.is_valid.is_(True), Image.is_duplicate.is_(False)
+        )
+    ) or 0
     area = sum(
         (p.summary or {}).get("area_ha") or 0
         for p in completed

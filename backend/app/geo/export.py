@@ -119,7 +119,8 @@ def export_kmz(source: Path, destination: Path, name: str = "Ortomosaico") -> Pa
 
     kml = simplekml.Kml(name=name)
     overlay = kml.newgroundoverlay(name=name)
-    overlay.icon.href = png_path.name
+    # addfile embute o PNG dentro do KMZ e devolve o caminho interno do arquivo.
+    overlay.icon.href = kml.addfile(str(png_path))
     overlay.latlonbox.north = north
     overlay.latlonbox.south = south
     overlay.latlonbox.east = east

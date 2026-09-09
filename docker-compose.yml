@@ -1,0 +1,77 @@
+# Ambiente completo: API, worker, fila, banco espacial, motor fotogramétrico e web.
+#
+#   docker compose up -d
+#   docker compose --profile gpu up -d      # NodeODM com CUDA
+#
+# As imagens do voo ficam em ./data (monte aqui o NAS ou o disco de imagens);
+# os produtos vão para ./storage.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: orto
+      POSTGRES_PASSWORD: orto
+      POSTGRES_DB: ortomosaico
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  nodeodm:
+    # Motor fotogramétrico. Faz SfM, bundle adjustment, DSM e ortorretificação.
+    image: opendronemap/nodeodm:latest
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./storage:/storage
+    restart: unless-stopped
+
+  api:
+    build: ./backend
+    environment:
+      ORTO_DATABASE_URL: postgresql+psycopg://orto:orto@db:5432/ortomosaico
+      ORTO_QUEUE_BACKEND: celery
+      ORTO_CELERY_BROKER_URL: redis://redis:6379/0
+      ORTO_NODEODM_URL: http://nodeodm:3000
+      ORTO_STORAGE_ROOT: /storage
+      # Restringe a varredura ao volume de imagens montado.
+      ORTO_SCAN_ALLOWED_ROOTS: /data
+    volumes:
+      - ./storage:/storage
+      - ./data:/data:ro
+    ports:
+      - "8000:8000"
+    depends_on: [db, redis, nodeodm]
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: celery -A app.processing.celery_app worker --loglevel=info --concurrency=1
+    environment:
+      ORTO_DATABASE_URL: postgresql+psycopg://orto:orto@db:5432/ortomosaico
+      ORTO_QUEUE_BACKEND: celery
+      ORTO_CELERY_BROKER_URL: redis://redis:6379/0
+      ORTO_NODEODM_URL: http://nodeodm:3000
+      ORTO_STORAGE_ROOT: /storage
+      ORTO_SCAN_ALLOWED_ROOTS: /data
+    volumes:
+      - ./storage:/storage
+      - ./data:/data:ro
+    depends_on: [db, redis, nodeodm]
+    restart: unless-stopped
+
+  web:
+    build: ./frontend
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
