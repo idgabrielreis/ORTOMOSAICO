@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+
+# Dados e produtos
+storage/
+*.db
+.env
+
+# Sistema
+.DS_Store
