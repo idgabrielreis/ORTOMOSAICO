@@ -1,8 +1,17 @@
 """Modelo de dados.
 
-Regra central do domínio: um projeto é um voo, e um voo é UM dataset.
+Hierarquia do domínio:
+
+    Fazenda -> Voo (Project) -> dataset de fotografias -> processamento -> ortomosaico
+
+Regra central: um voo é UM dataset e gera UM ortomosaico.
 `Image.relative_path` guarda a subpasta de origem apenas como informação de
-diagnóstico e relatório; ela nunca agrupa nem separa o processamento.
+diagnóstico e relatório; ela nunca agrupa nem separa o processamento. Nenhuma
+entidade abaixo do voo divide o processamento — talhões, quando existirem,
+serão camada GIS desenhada sobre o ortomosaico pronto.
+
+O KML do planejamento é referência geográfica (`PlanningArea`), nunca insumo do
+ortomosaico: o produto sai das fotografias.
 """
 from __future__ import annotations
 
@@ -45,6 +54,16 @@ class ProjectStatus(StrEnum):
     FAILED = "failed"
 
 
+class PositionSource(StrEnum):
+    """Origem da posição de cada fotografia, em ordem crescente de precisão."""
+
+    NONE = "none"
+    EXIF_GPS = "exif_gps"      # GPS de navegação gravado no EXIF
+    RTK = "rtk"                # correção em tempo real, marcada no XMP da DJI
+    PPK = "ppk"                # pós-processada contra base GNSS
+    GCP_ADJUSTED = "gcp"       # ajustada no bundle adjustment com pontos de controle
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -53,10 +72,33 @@ class JobStatus(StrEnum):
     CANCELED = "canceled"
 
 
+class Farm(Base):
+    """Fazenda: agrupa voos. Não participa do processamento."""
+
+    __tablename__ = "farms"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    flights: Mapped[list["Project"]] = relationship(
+        back_populates="farm", cascade="all, delete-orphan", order_by="Project.created_at.desc()"
+    )
+
+
 class Project(Base):
+    """Um voo. É a unidade de processamento: um dataset, um ortomosaico."""
+
     __tablename__ = "projects"
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    farm_id: Mapped[str | None] = mapped_column(
+        ForeignKey("farms.id", ondelete="SET NULL"), default=None, index=True
+    )
+    flight_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(20), default=ProjectStatus.CREATED)
@@ -74,8 +116,12 @@ class Project(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
 
+    farm: Mapped["Farm | None"] = relationship(back_populates="flights")
     images: Mapped[list["Image"]] = relationship(
         back_populates="project", cascade="all, delete-orphan", lazy="selectin"
+    )
+    planning_areas: Mapped[list["PlanningArea"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
     )
     jobs: Mapped[list["Job"]] = relationship(
         back_populates="project", cascade="all, delete-orphan", order_by="Job.created_at.desc()"
@@ -129,6 +175,15 @@ class Image(Base):
     sensor_width_mm: Mapped[float | None] = mapped_column(Float, default=None)
     band: Mapped[str | None] = mapped_column(String(32), default=None)  # RGB, NIR, RedEdge...
     rtk_flag: Mapped[str | None] = mapped_column(String(32), default=None)
+
+    # Posicionamento: o GPS de navegação é apenas a fonte mais fraca. RTK vem
+    # marcado no XMP; PPK chega depois, por importação das posições corrigidas.
+    position_source: Mapped[str] = mapped_column(String(16), default=PositionSource.NONE)
+    horizontal_accuracy_m: Mapped[float | None] = mapped_column(Float, default=None)
+    vertical_accuracy_m: Mapped[float | None] = mapped_column(Float, default=None)
+    original_latitude: Mapped[float | None] = mapped_column(Float, default=None)
+    original_longitude: Mapped[float | None] = mapped_column(Float, default=None)
+    original_altitude: Mapped[float | None] = mapped_column(Float, default=None)
 
     extra: Mapped[dict] = mapped_column(JSON, default=dict)  # XMP bruto relevante
 
@@ -188,6 +243,50 @@ class Product(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     project: Mapped[Project] = relationship(back_populates="products")
+
+
+class PlanningArea(Base):
+    """Área planejada do voo, importada de KML/KMZ.
+
+    Referência de planejamento e comparação com o que foi realmente fotografado.
+    Nunca entra no cálculo do ortomosaico.
+    """
+
+    __tablename__ = "planning_areas"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(200), default="Planejamento")
+    source_file: Mapped[str] = mapped_column(Text, default="")
+    geojson: Mapped[dict] = mapped_column(JSON, default=dict)
+    area_ha: Mapped[float | None] = mapped_column(Float, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    project: Mapped[Project] = relationship(back_populates="planning_areas")
+
+
+class GnssDataset(Base):
+    """Arquivos de base GNSS e resultados de PPK associados ao voo.
+
+    O MVP importa posições já corrigidas (CSV/TXT). Guardar a origem aqui é o
+    que permite, depois, rodar o pós-processamento dentro do próprio app.
+    """
+
+    __tablename__ = "gnss_datasets"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(30), default="corrected_positions")
+    source_file: Mapped[str] = mapped_column(Text, default="")
+    epsg: Mapped[int] = mapped_column(Integer, default=4326)
+    applied_to: Mapped[int] = mapped_column(Integer, default=0)
+    not_matched: Mapped[list] = mapped_column(JSON, default=list)
+    stats: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class GroundControlPoint(Base):

@@ -42,3 +42,30 @@ def init_db() -> None:
     from . import models  # noqa: F401  (registra as tabelas)
 
     models.Base.metadata.create_all(engine)
+    _add_missing_columns(models.Base)
+
+
+def _add_missing_columns(base) -> None:
+    """Migração mínima: cria colunas novas em tabelas que já existem.
+
+    `create_all` só cria tabelas ausentes, então um banco de uma versão
+    anterior ficaria sem as colunas adicionadas depois. Alembic entra quando
+    houver mudança que exija transformar dados; para colunas novas e anuláveis
+    um ALTER TABLE direto resolve, e mantém o protótipo rodando sem passo extra.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as connection:
+        for table in base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue
+            present = {column["name"] for column in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in present:
+                    continue
+                column_type = column.type.compile(engine.dialect)
+                connection.execute(
+                    text(f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {column_type}')
+                )

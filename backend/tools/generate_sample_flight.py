@@ -42,6 +42,40 @@ XMP_TEMPLATE = """<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <?xpacket end="w"?>"""
 
 
+def build_terrain(width: int, height: int, ground_gsd: float, seed: int = 11) -> np.ndarray:
+    """Campo de altitudes do terreno, em metros acima do plano de referência.
+
+    Sem relevo não existe paralaxe entre as fotos, e sem paralaxe nenhuma
+    reconstrução fotogramétrica é possível: as imagens ficariam ligadas por uma
+    homografia e a profundidade seria indeterminada. O terreno tem colinas
+    suaves, um talude e árvores isoladas, que é o que dá volume ao MDS.
+    """
+    rng = np.random.default_rng(seed)
+    ys, xs = np.mgrid[0:height, 0:width].astype(np.float32)
+    xs *= ground_gsd
+    ys *= ground_gsd
+    terrain = np.zeros((height, width), dtype=np.float32)
+
+    for _ in range(5):  # colinas
+        cx = rng.uniform(0, width * ground_gsd)
+        cy = rng.uniform(0, height * ground_gsd)
+        amplitude = rng.uniform(4.0, 14.0)
+        sigma = rng.uniform(40.0, 110.0)
+        terrain += amplitude * np.exp(-(((xs - cx) ** 2 + (ys - cy) ** 2) / (2 * sigma**2)))
+
+    # Talude atravessando a área: garante variação sistemática de cota.
+    terrain += np.clip((xs - width * ground_gsd * 0.55) * 0.035, 0, 6.0)
+
+    for _ in range(90):  # árvores e moitas
+        cx = rng.uniform(0, width * ground_gsd)
+        cy = rng.uniform(0, height * ground_gsd)
+        amplitude = rng.uniform(3.0, 9.0)
+        sigma = rng.uniform(2.0, 5.0)
+        terrain += amplitude * np.exp(-(((xs - cx) ** 2 + (ys - cy) ** 2) / (2 * sigma**2)))
+
+    return cv2.GaussianBlur(terrain, (0, 0), 1.5)
+
+
 def build_scene(width: int, height: int, seed: int = 7) -> np.ndarray:
     """Cena sintética que lembra talhões agrícolas vistos de cima."""
     rng = np.random.default_rng(seed)
@@ -60,11 +94,63 @@ def build_scene(width: int, height: int, seed: int = 7) -> np.ndarray:
         cx, cy = int(rng.integers(0, width)), int(rng.integers(0, height))
         cv2.circle(scene, (cx, cy), int(rng.integers(6, 26)),
                    tuple(int(c) for c in rng.integers(20, 240, 3)), -1)
-    cv2.putText(scene, "TALHAO A", (width // 8, height // 3),
-                cv2.FONT_HERSHEY_SIMPLEX, width / 500, (250, 250, 250), 6)
-    cv2.putText(scene, "TALHAO B", (width // 2, int(height * 0.75)),
-                cv2.FONT_HERSHEY_SIMPLEX, width / 500, (250, 250, 250), 6)
+    # Textura de alta frequência: sem ela o detector de características não tem
+    # o que casar entre as fotos.
+    noise = rng.integers(0, 40, (height, width, 1), dtype=np.int16)
+    scene = np.clip(scene.astype(np.int16) + noise - 20, 0, 255).astype(np.uint8)
     return cv2.GaussianBlur(scene, (3, 3), 0)
+
+
+def render_view(
+    texture: np.ndarray,
+    terrain: np.ndarray,
+    ground_gsd: float,
+    origin: tuple[float, float],
+    camera_xyz: tuple[float, float, float],
+    yaw_deg: float,
+    focal_px: float,
+    size: tuple[int, int],
+) -> np.ndarray:
+    """Renderiza o que a câmera veria, com projeção perspectiva sobre o relevo.
+
+    Para cada pixel traça-se o raio da câmera e busca-se a interseção com o
+    campo de altitudes, iterando a partir do plano médio. É essa interseção que
+    produz o deslocamento devido ao relevo — o mesmo efeito que a
+    ortorretificação depois corrige.
+    """
+    width_px, height_px = size
+    cam_x, cam_y, cam_z = camera_xyz
+    west, north = origin
+    terrain_h, terrain_w = terrain.shape
+
+    us, vs = np.meshgrid(
+        np.arange(width_px, dtype=np.float32) + 0.5,
+        np.arange(height_px, dtype=np.float32) + 0.5,
+    )
+    # Raio no referencial da câmera (nadir), depois girado pelo yaw.
+    dx = (us - width_px / 2) / focal_px
+    dy = (vs - height_px / 2) / focal_px
+    theta = math.radians(yaw_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    east_component = dx * cos_t + dy * sin_t
+    north_component = -(dx * -sin_t + dy * cos_t)
+
+    def sample_terrain(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        col = np.clip((x - west) / ground_gsd, 0, terrain_w - 1).astype(np.float32)
+        row = np.clip((north - y) / ground_gsd, 0, terrain_h - 1).astype(np.float32)
+        return cv2.remap(terrain, col, row, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    ground_z = float(np.median(terrain))
+    depth = cam_z - ground_z
+    for _ in range(6):  # converge a interseção raio/terreno
+        x = cam_x + east_component * depth
+        y = cam_y + north_component * depth
+        z = sample_terrain(x, y)
+        depth = cam_z - z
+
+    col = np.clip((x - west) / ground_gsd, 0, terrain_w - 1).astype(np.float32)
+    row = np.clip((north - y) / ground_gsd, 0, terrain_h - 1).astype(np.float32)
+    return cv2.remap(texture, col, row, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 
 def dd_to_dms(value: float) -> tuple[float, float, float]:
@@ -143,14 +229,21 @@ def generate(
 
     total_w = step_x * (cols - 1) + ground_w
     total_h = step_y * (rows - 1) + ground_h
+    # Margem: a foto enxerga além do nadir quando o terreno é baixo.
+    margin = ground_w * 0.6
     scene_gsd = gsd / 2  # cena com o dobro da resolução das fotos
-    scene = build_scene(int(total_w / scene_gsd), int(total_h / scene_gsd), seed=seed)
-    scene_h, scene_w = scene.shape[:2]
+    scene_w = int((total_w + 2 * margin) / scene_gsd)
+    scene_h = int((total_h + 2 * margin) / scene_gsd)
+    scene = build_scene(scene_w, scene_h, seed=seed)
+    terrain = build_terrain(scene_w, scene_h, scene_gsd, seed=seed + 4)
 
-    west, north = cx - total_w / 2, cy + total_h / 2
+    west, north = cx - total_w / 2 - margin, cy + total_h / 2 + margin
+    focal_px = focal_mm * width_px / sensor_width_mm
+    ground_reference = float(np.median(terrain))
     start = datetime(2026, 9, 9, 9, 30, 0)
     manifest = {"images": [], "epsg": epsg, "gsd_cm": round(gsd * 100, 2),
-                "area_ha": round(total_w * total_h / 10_000, 2)}
+                "area_ha": round(total_w * total_h / 10_000, 2),
+                "terrain_min_m": None, "terrain_max_m": None}
 
     index = 0
     written: list[Path] = []
@@ -162,16 +255,12 @@ def generate(
             x = west + ground_w / 2 + actual_col * step_x + random.uniform(-1.5, 1.5)
             y = north - ground_h / 2 - row * step_y + random.uniform(-1.5, 1.5)
 
-            px = int((x - west) / scene_gsd)
-            py = int((north - y) / scene_gsd)
-            half_w = int(ground_w / 2 / scene_gsd)
-            half_h = int(ground_h / 2 / scene_gsd)
-            x0, x1 = max(0, px - half_w), min(scene_w, px + half_w)
-            y0, y1 = max(0, py - half_h), min(scene_h, py + half_h)
-            crop = scene[y0:y1, x0:x1]
-            if crop.size == 0:
-                continue
-            frame = cv2.resize(crop, (width_px, height_px), interpolation=cv2.INTER_AREA)
+            yaw = random.uniform(-1.5, 1.5)
+            camera_z = ground_reference + altitude + random.uniform(-1.0, 1.0)
+            frame = render_view(
+                scene, terrain, scene_gsd, (west, north), (x, y, camera_z),
+                yaw, focal_px, (width_px, height_px),
+            )
             # Variação de exposição entre faixas, como acontece em voo real.
             frame = np.clip(frame.astype(np.float32) * random.uniform(0.88, 1.12), 0, 255)
             frame = frame.astype(np.uint8)
@@ -182,8 +271,8 @@ def generate(
             path = out_dir / part / name
             write_image(
                 path, frame, latitude=lat, longitude=lon,
-                absolute_altitude=520.0 + altitude, relative_altitude=altitude,
-                yaw=random.uniform(-1.0, 1.0),
+                absolute_altitude=520.0 + camera_z, relative_altitude=camera_z - ground_reference,
+                yaw=yaw,
                 captured_at=start + timedelta(seconds=index * 2),
                 focal_mm=focal_mm, focal_35mm=focal_35mm, band="RGB",
             )
@@ -202,6 +291,8 @@ def generate(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(written[i].read_bytes())
 
+    manifest["terrain_min_m"] = round(float(terrain.min()), 2)
+    manifest["terrain_max_m"] = round(float(terrain.max()), 2)
     manifest["folders"] = sorted({p.parent.name for p in written} | {"BACKUP_CARTAO"})
     manifest["count"] = len(written)
     return manifest

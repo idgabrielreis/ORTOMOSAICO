@@ -20,6 +20,15 @@ from ..utils.images import sniff_format
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
 
+# Arquivos que acompanham um voo RTK/PPK da DJI e viajam junto das fotos.
+# Não são imagens, mas descrevem o posicionamento delas.
+AUXILIARY_EXTENSIONS = {
+    ".mrk": "mrk",        # evento de cada foto: posição corrigida e desvios
+    ".obs": "rinex_obs",  # observações do receptor do drone
+    ".nav": "rinex_nav",  # efemérides
+    ".bin": "ppk_raw",    # bruto do receptor, entrada do pós-processamento
+}
+
 # Diretórios que nunca contêm imagens do voo (ruído de sistema de arquivos,
 # saídas do próprio app, caches de outros softwares de fotogrametria).
 IGNORED_DIRS = {
@@ -46,12 +55,27 @@ class FoundFile:
 
 
 @dataclass
+class AuxiliaryFile:
+    """Arquivo de apoio ao voo (MRK, RINEX, bruto do receptor)."""
+
+    path: Path
+    relative_path: str
+    folder: str
+    kind: str
+    size_bytes: int
+
+
+@dataclass
 class DiscoveryResult:
     root: Path
     files: list[FoundFile] = field(default_factory=list)
     folders: set[str] = field(default_factory=set)
+    auxiliary: list[AuxiliaryFile] = field(default_factory=list)
     scanned_entries: int = 0
     skipped_extensions: dict[str, int] = field(default_factory=dict)
+
+    def auxiliary_of(self, kind: str) -> list[AuxiliaryFile]:
+        return [item for item in self.auxiliary if item.kind == kind]
 
     @property
     def valid(self) -> list[FoundFile]:
@@ -133,7 +157,19 @@ def discover_images(
         result.scanned_entries = scanned
         ext = path.suffix.lower()
         if ext not in IMAGE_EXTENSIONS:
-            if ext:
+            rel_aux = path.relative_to(root).as_posix()
+            kind = AUXILIARY_EXTENSIONS.get(ext)
+            if kind:
+                result.auxiliary.append(
+                    AuxiliaryFile(
+                        path=path,
+                        relative_path=rel_aux,
+                        folder=str(Path(rel_aux).parent) if "/" in rel_aux else ".",
+                        kind=kind,
+                        size_bytes=st.st_size,
+                    )
+                )
+            elif ext:
                 result.skipped_extensions[ext] = result.skipped_extensions.get(ext, 0) + 1
             continue
 

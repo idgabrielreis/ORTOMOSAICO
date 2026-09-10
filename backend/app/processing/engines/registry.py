@@ -4,9 +4,12 @@ from __future__ import annotations
 from ...config import settings
 from .direct import DirectGeoreferencingEngine
 from .odm import ODMEngine
+from .sfm import SfmEngine
 
+# Ordem de preferência do modo automático: precisão primeiro.
 _ENGINES = {
     "odm": ODMEngine(),
+    "sfm": SfmEngine(),
     "direct": DirectGeoreferencingEngine(),
 }
 
@@ -37,7 +40,8 @@ def resolve_engine(requested: str | None):
     requested = requested or settings.default_engine
     if requested != "auto":
         return get_engine(requested)
-    odm = _ENGINES["odm"]
-    if odm.availability()[0]:
-        return odm
+    for name in ("odm", "sfm", "direct"):
+        engine = _ENGINES[name]
+        if engine.availability()[0]:
+            return engine
     return _ENGINES["direct"]

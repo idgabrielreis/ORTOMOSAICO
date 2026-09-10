@@ -138,6 +138,40 @@ def sensor_width(model: str | None, exif: dict[str, Any], width_px: int | None) 
     return None
 
 
+# RtkFlag da DJI: 0 sem correção, 16 float, 34/50 fixed (varia por firmware).
+RTK_FIXED_FLAGS = {"16", "34", "50"}
+
+
+def _positioning(xmp: dict[str, str], lat: float | None, lon: float | None) -> dict[str, Any]:
+    """Classifica a origem da posição e o desvio informado pelo drone.
+
+    O GPS de navegação é só a fonte mais fraca: quando o voo é RTK, o XMP traz
+    a flag e os desvios padrão de cada eixo. PPK entra depois, por importação
+    das posições corrigidas, e sobrescreve estes valores.
+    """
+    if lat is None or lon is None:
+        return {"position_source": "none", "horizontal_accuracy_m": None,
+                "vertical_accuracy_m": None}
+
+    std_lat = _to_float(xmp.get("RtkStdLat"))
+    std_lon = _to_float(xmp.get("RtkStdLon"))
+    std_hgt = _to_float(xmp.get("RtkStdHgt"))
+    flag = (xmp.get("RtkFlag") or "").strip()
+
+    horizontal = None
+    if std_lat is not None and std_lon is not None:
+        horizontal = round((std_lat**2 + std_lon**2) ** 0.5, 4)
+    elif std_lat is not None or std_lon is not None:
+        horizontal = std_lat if std_lat is not None else std_lon
+
+    is_rtk = flag in RTK_FIXED_FLAGS or (horizontal is not None and horizontal < 0.5)
+    return {
+        "position_source": "rtk" if is_rtk else "exif_gps",
+        "horizontal_accuracy_m": horizontal,
+        "vertical_accuracy_m": std_hgt,
+    }
+
+
 def read_metadata(path: Path | str) -> dict[str, Any]:
     """Devolve os metadados de uma imagem. Nunca levanta exceção."""
     path = Path(path)
@@ -190,7 +224,8 @@ def read_metadata(path: Path | str) -> dict[str, Any]:
     meta["yaw"] = _to_float(xmp.get("GimbalYawDegree") or xmp.get("FlightYawDegree"))
     meta["pitch"] = _to_float(xmp.get("GimbalPitchDegree") or xmp.get("FlightPitchDegree"))
     meta["roll"] = _to_float(xmp.get("GimbalRollDegree") or xmp.get("FlightRollDegree"))
-    meta["rtk_flag"] = xmp.get("RtkFlag") or xmp.get("RtkStdLon")
+    meta["rtk_flag"] = xmp.get("RtkFlag")
+    meta.update(_positioning(xmp, lat, lon))
     meta["band"] = detect_band(path.name, xmp)
 
     meta["extra"] = {

@@ -106,6 +106,9 @@ def import_flight(project_id: str, root: Path | str, reporter: JobReporter) -> d
                     sensor_width_mm=meta.get("sensor_width_mm"),
                     band=meta.get("band"),
                     rtk_flag=meta.get("rtk_flag"),
+                    position_source=meta.get("position_source") or "none",
+                    horizontal_accuracy_m=meta.get("horizontal_accuracy_m"),
+                    vertical_accuracy_m=meta.get("vertical_accuracy_m"),
                     extra=meta.get("extra") or {},
                 )
             )
