@@ -67,7 +67,9 @@ def test_ortomosaico_gerado_e_georreferenciado(projeto_importado: str):
 
         with rasterio.open(product.path) as src:
             assert src.crs is not None and src.crs.to_epsg() == product.epsg
-            assert src.count == 4                      # RGB + alfa
+            assert src.count == 3                      # RGB puro, como no Pix4D
+            # A área sem cobertura vai na máscara interna, não em uma quarta banda.
+            assert src.mask_flag_enums[0]
             assert abs(src.transform.a) > 0            # transformação afim válida
             assert src.width > 200 and src.height > 100
             # A área coberta precisa bater com a extensão do voo, não com uma

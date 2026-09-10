@@ -205,20 +205,23 @@ class DirectGeoreferencingEngine:
         ortho_path = ctx.output_dir / "orthomosaic.tif"
         transform = from_origin(minx, maxy, gsd, gsd)
         profile = {
-            "driver": "GTiff", "height": height, "width": width, "count": 4,
+            "driver": "GTiff", "height": height, "width": width, "count": 3,
             "dtype": "uint8", "crs": f"EPSG:{epsg}", "transform": transform,
             "compress": "deflate", "predictor": 2, "tiled": True,
             "blockxsize": 512, "blockysize": 512, "BIGTIFF": "IF_SAFER",
         }
-        with rasterio.open(ortho_path, "w", **profile) as dst:
-            # OpenCV entrega BGR; o GeoTIFF sai em RGB + alfa.
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True), rasterio.open(
+            ortho_path, "w", **profile
+        ) as dst:
+            # OpenCV entrega BGR; o GeoTIFF sai em RGB, com a área sem cobertura
+            # na máscara interna em vez de uma quarta banda.
             dst.write(rgb[:, :, 2], 1)
             dst.write(rgb[:, :, 1], 2)
             dst.write(rgb[:, :, 0], 3)
-            dst.write(alpha, 4)
+            dst.write_mask(alpha)
             dst.colorinterp = [
                 rasterio.enums.ColorInterp.red, rasterio.enums.ColorInterp.green,
-                rasterio.enums.ColorInterp.blue, rasterio.enums.ColorInterp.alpha,
+                rasterio.enums.ColorInterp.blue,
             ]
             dst.build_overviews([2, 4, 8, 16], rasterio.enums.Resampling.average)
             dst.update_tags(

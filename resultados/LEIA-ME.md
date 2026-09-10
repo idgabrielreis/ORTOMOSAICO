@@ -8,6 +8,7 @@ Ortomosaico gerado pelo aplicativo a partir das 56 fotografias do voo.
 | Sistema de coordenadas | EPSG:32723 (WGS84 / UTM 23S) |
 | Dimensões | 14.786 x 14.933 px |
 | GSD | 2,48 cm/pixel |
+| Bandas | 3 (Red, Green, Blue), com máscara interna para a área sem cobertura |
 | Compressão | JPEG dentro do GeoTIFF, qualidade 88 |
 | Fotos alinhadas | 56 de 56 |
 | Pontos reconstruídos | 97.501 |

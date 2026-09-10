@@ -813,15 +813,19 @@ class SfmEngine:
         tiles_y = math.ceil(height / ORTHO_TILE)
         tiles_total = tiles_x * tiles_y
 
-        with rasterio.open(
-            ortho_path, "w", driver="GTiff", height=height, width=width, count=4,
+        # Três bandas RGB, como entregam os softwares fotogramétricos: a área sem
+        # cobertura vai na máscara interna do GeoTIFF, não em uma quarta banda.
+        # Assim o QGIS abre o arquivo como Banda 1/2/3 (Red, Green, Blue) e ainda
+        # respeita a transparência.
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True), rasterio.open(
+            ortho_path, "w", driver="GTiff", height=height, width=width, count=3,
             dtype="uint8", crs=f"EPSG:{epsg}", transform=transform_affine,
             compress="deflate", predictor=2, tiled=True, blockxsize=512, blockysize=512,
             BIGTIFF="YES", num_threads="ALL_CPUS",
         ) as dst:
             dst.colorinterp = [
                 rasterio.enums.ColorInterp.red, rasterio.enums.ColorInterp.green,
-                rasterio.enums.ColorInterp.blue, rasterio.enums.ColorInterp.alpha,
+                rasterio.enums.ColorInterp.blue,
             ]
             dst.update_tags(
                 ORTOMOSAICO_ENGINE="sfm", ORTOMOSAICO_GSD_CM=f"{gsd * 100:.2f}",
@@ -882,7 +886,7 @@ class SfmEngine:
                     dst.write(rgb[:, :, 2], 1, window=window)
                     dst.write(rgb[:, :, 1], 2, window=window)
                     dst.write(rgb[:, :, 0], 3, window=window)
-                    dst.write((covered * 255).astype(np.uint8), 4, window=window)
+                    dst.write_mask((covered * 255).astype(np.uint8), window=window)
 
                     ctx.progress(
                         7, done / tiles_total,
