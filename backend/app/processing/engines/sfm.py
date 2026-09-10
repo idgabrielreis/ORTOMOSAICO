@@ -46,6 +46,13 @@ DSM_GSD_FACTOR = 8
 NEIGHBORS_PER_IMAGE = 12          # padrão de pares por imagem; o preset de qualidade ajusta
 DSM_SMOOTH_ITERATIONS = 2
 
+# Expoente aplicado ao peso de cada foto na composição. Com expoente 1 o pixel
+# vira média de todas as fotos que o enxergam, e qualquer discordância de meio
+# pixel entre elas aparece como borrão. Com expoente alto a melhor foto domina
+# quase por completo, como faz a costura por seamline dos softwares comerciais,
+# e a transição entre imagens continua suave onde os pesos se equivalem.
+WEIGHT_SHARPNESS = 10
+
 # Acima disso o modelo não bate com as posições do drone e o produto não presta.
 MAX_GEOREFERENCE_RMS_M = 60.0
 
@@ -185,6 +192,77 @@ def _build_dsm(
         surface = cv2.GaussianBlur(surface, (5, 5), 0)
     surface = np.where(valid, dsm, surface).astype(np.float32)
     return surface, valid
+
+
+def _write_pose_priors(
+    database_path: Path, locations: dict[str, tuple[float, float, float]],
+    images: list[ImageRef],
+) -> int:
+    """Grava a posição de cada foto no banco do COLMAP, em metros do CRS do projeto.
+
+    O COLMAP já cria priors a partir do GPS do EXIF, mas em graus (WGS84) e sem
+    incerteza declarada. Aqui eles são substituídos pela posição projetada, em
+    metros, com a covariância vinda da precisão que a própria foto informa:
+    fotos com RTK puxam muito o ajuste, fotos com GPS de navegação puxam pouco.
+
+    É o que faz a posição das câmeras entrar como observação no bundle
+    adjustment, e não apenas no encaixe final do modelo pronto — a diferença
+    entre um bloco que "entorta" e um que fica na posição certa.
+    """
+    import pycolmap
+
+    accuracy = {image.name: image.horizontal_accuracy_m for image in images}
+    database = pycolmap.Database.open(str(database_path))
+    written = 0
+    try:
+        by_data_id = {image.data_id.id: image for image in database.read_all_images()}
+        existing = {prior.corr_data_id.id: prior for prior in database.read_all_pose_priors()}
+
+        for data_id, image in by_data_id.items():
+            position = locations.get(image.name)
+            if position is None:
+                continue
+            sigma = accuracy.get(image.name) or 2.0
+            sigma = min(max(sigma, 0.02), 10.0)
+            covariance = np.diag(
+                # A componente vertical do GNSS costuma ser cerca de duas vezes
+                # pior que a horizontal.
+                [sigma**2, sigma**2, (2 * sigma) ** 2]
+            ).astype(np.float64)
+
+            prior = existing.get(data_id)
+            if prior is None:
+                prior = pycolmap.PosePrior()
+                prior.corr_data_id = image.data_id
+                prior.position = np.array(position, dtype=np.float64)
+                prior.position_covariance = covariance
+                prior.coordinate_system = pycolmap.PosePriorCoordinateSystem.CARTESIAN
+                database.write_pose_prior(prior)
+            else:
+                prior.position = np.array(position, dtype=np.float64)
+                prior.position_covariance = covariance
+                prior.coordinate_system = pycolmap.PosePriorCoordinateSystem.CARTESIAN
+                database.update_pose_prior(prior)
+            written += 1
+    finally:
+        database.close()
+    return written
+
+
+def _position_rms(
+    reconstruction, locations: dict[str, tuple[float, float, float]]
+) -> float | None:
+    """Distância média entre as câmeras do modelo e as posições medidas."""
+    residuals = []
+    for image in reconstruction.images.values():
+        target = locations.get(image.name)
+        if target is None:
+            continue
+        center = np.asarray(image.projection_center(), dtype=np.float64)
+        residuals.append(float(np.linalg.norm(center - np.array(target))))
+    if not residuals:
+        return None
+    return math.sqrt(sum(r**2 for r in residuals) / len(residuals))
 
 
 def _umeyama(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
@@ -455,9 +533,9 @@ class _View:
             ((px - center_x) / (source.shape[1] / 2)) ** 2
             + ((py - center_y) / (source.shape[0] / 2)) ** 2
         )
-        weight = np.clip(1.15 - normalized, 0.0, 1.0) ** 2
+        weight = np.clip(1.15 - normalized, 0.0, 1.0)
         # Visada mais próxima da vertical vale mais na composição.
-        weight = weight * incidence_cos**2
+        weight = (weight * incidence_cos) ** WEIGHT_SHARPNESS
         weight = np.where(inside, weight, 0.0).astype(np.float32).reshape(shape)
         return sampled, weight
 
@@ -567,6 +645,15 @@ class SfmEngine:
                 f"Características {start + len(chunk)}/{len(names)}",
             )
 
+        # Posições das fotos entram como observação no ajuste, não só no encaixe
+        # final: é isso que o Pix4D faz e o que segura a geometria do bloco.
+        priors_written = _write_pose_priors(database, locations, images)
+        if priors_written:
+            ctx.log(
+                f"{priors_written} posições gravadas como prior do bundle adjustment "
+                f"(EPSG:{epsg})"
+            )
+
         # ------------------------------------------------------------- matching
         ctx.progress(4, 0.1, "Selecionando pares pelo GPS")
         pairs = _gps_pairs(images, epsg, neighbors=preset["neighbors"])
@@ -612,6 +699,17 @@ class SfmEngine:
             mapper_options.ba_refine_focal_length = False
             mapper_options.ba_refine_principal_point = False
             mapper_options.ba_refine_extra_params = bool(calibration is None)
+        if priors_written:
+            # O ajuste passa a minimizar reprojeção E distância às posições
+            # medidas, então o modelo já sai em coordenadas do terreno.
+            mapper_options.use_prior_position = True
+            mapper_options.use_robust_loss_on_prior_position = True
+            accuracies = [
+                image.horizontal_accuracy_m for image in images if image.horizontal_accuracy_m
+            ]
+            mapper_options.prior_position_loss_scale = max(
+                0.05, statistics.fmean(accuracies) if accuracies else 2.0
+            )
         reconstructions = pycolmap.incremental_mapping(
             database_path=database,
             image_path=image_dir,
@@ -641,10 +739,23 @@ class SfmEngine:
             if image.name in locations
         ]
         target = np.array([locations[name] for name in registered_names], dtype=np.float64)
-        transform = pycolmap.align_reconstruction_to_locations(
-            reconstruction, registered_names, target, 3, pycolmap.RANSACOptions()
-        )
-        if transform is None:
+
+        # Com priors no ajuste o modelo já nasce em coordenadas do terreno;
+        # nesse caso não há transformação nenhuma a aplicar depois.
+        prior_rms = _position_rms(reconstruction, locations)
+        if priors_written and prior_rms is not None and prior_rms < 5.0:
+            ctx.log(
+                f"modelo já georreferenciado pelo ajuste: RMS {prior_rms:.3f} m "
+                "(nenhuma transformação aplicada depois)"
+            )
+            transform = None
+            skip_alignment = True
+        else:
+            skip_alignment = False
+            transform = pycolmap.align_reconstruction_to_locations(
+                reconstruction, registered_names, target, 3, pycolmap.RANSACOptions()
+            )
+        if transform is None and not skip_alignment:
             # RANSAC precisa de posições bem distribuídas. Em uma faixa única ou
             # trecho curto elas ficam quase colineares e a rotação em torno do
             # eixo do voo fica indefinida; a orientação do gimbal resolve isso.
@@ -662,11 +773,12 @@ class SfmEngine:
                     f"a orientação do gimbal de {used} fotografias. Com uma única faixa de voo "
                     "a orientação do modelo é menos confiável do que com faixas cruzadas"
                 )
-        if transform is None:
+        if transform is None and not skip_alignment:
             raise EngineUnavailable(
                 "não foi possível alinhar a reconstrução às posições das fotografias"
             )
-        reconstruction.transform(transform)
+        if transform is not None:
+            reconstruction.transform(transform)
 
         residuals = []
         for image in reconstruction.images.values():
@@ -873,7 +985,9 @@ class SfmEngine:
                         accumulator += sampled * weight[..., None]
                         weights += weight
 
-                    covered = weights > 1e-3
+                    # Com o expoente de nitidez os pesos ficam pequenos por
+                    # construção; o limiar precisa ser só "maior que zero".
+                    covered = weights > 1e-12
                     if not covered.any():
                         continue
                     coverage_pixels += int(covered.sum())

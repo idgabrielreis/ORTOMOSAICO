@@ -191,7 +191,7 @@ class DirectGeoreferencingEngine:
             if index % 5 == 0 or index == total:
                 ctx.progress(7, index / total, f"Compondo mosaico ({index}/{total})")
 
-        covered = weights > 1e-3
+        covered = weights > 1e-12
         if not covered.any():
             raise EngineUnavailable("nenhuma imagem pôde ser projetada no mosaico")
 
