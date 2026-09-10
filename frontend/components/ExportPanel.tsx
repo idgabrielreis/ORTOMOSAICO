@@ -17,10 +17,8 @@ export function ExportPanel({ projectId }: { projectId: string }) {
   if (error) return <div className="alert warn">{error}</div>;
 
   const downloads: [string, string, string][] = [
-    ["geotiff", "GeoTIFF", "Produto georreferenciado, com CRS e transformação preservados"],
+    ["geotiff", "Ortomosaico RGB (GeoTIFF)", "Orto_<projeto>.rgb.tif, georreferenciado, na resolução do processamento"],
     ["png", "PNG", "Imagem de visualização, reamostrada"],
-    ["kmz", "KMZ", "GroundOverlay para Google Earth"],
-    ["worldfile", "World File", "Transformação afim em texto, para acompanhar o PNG/TIFF"],
     ["report", "Relatório", "JSON com parâmetros, avisos e estatísticas do processamento"],
   ];
 

@@ -15,6 +15,7 @@ from ..geo.crs import utm_epsg
 from ..geo.footprint import CameraGeometry, footprint_corners
 from ..ingest.summary import build_summary
 from ..models import Image, Job, JobStatus, Product, Project, ProjectStatus
+from ..processing.quality import resolve_quality
 from ..processing.queue import enqueue
 from ..schemas import ImageOut, ProductOut, ProjectCreate, ProjectOut, ProjectUpdate, ScanRequest
 from ..utils.images import make_thumbnail
@@ -45,6 +46,7 @@ def _check_scan_root(path: Path) -> Path:
 def create_project(payload: ProjectCreate, db: Session = Depends(get_db)) -> Project:
     project = Project(
         name=payload.name, description=payload.description,
+        quality=resolve_quality(payload.quality),
         output_epsg=payload.output_epsg, target_gsd_cm=payload.target_gsd_cm,
         source_path=payload.source_path,
     )
@@ -84,18 +86,27 @@ def delete_project(project_id: str, db: Session = Depends(get_db)) -> None:
 
 
 @router.post("/{project_id}/scan", status_code=202)
-def scan_folder(project_id: str, payload: ScanRequest, db: Session = Depends(get_db)) -> dict:
-    """Varre a pasta do voo no servidor. Todas as subpastas viram UM dataset."""
+def scan_folders(project_id: str, payload: ScanRequest, db: Session = Depends(get_db)) -> dict:
+    """Varre as pastas escolhidas no servidor.
+
+    Uma pasta ou dez: todas as imagens encontradas, em qualquer subpasta,
+    entram no MESMO dataset e geram um único ortomosaico.
+    """
     project = _get_project(db, project_id)
-    root = _check_scan_root(Path(payload.path))
-    job = Job(project_id=project.id, kind="scan", engine="-", options={"root": str(root)})
-    project.source_path = str(root)
+    selected = payload.all_paths()
+    if not selected:
+        raise HTTPException(400, "selecione ao menos uma pasta de imagens")
+    roots = [str(_check_scan_root(Path(item))) for item in selected]
+
+    job = Job(project_id=project.id, kind="scan", engine="-", options={"roots": roots})
+    project.source_path = roots[0]
+    project.source_paths = roots
     project.source_kind = "server"
     project.status = ProjectStatus.SCANNING
     db.add(job)
     db.commit()
     backend = enqueue(job.id, "scan")
-    return {"job_id": job.id, "queue": backend, "root": str(root)}
+    return {"job_id": job.id, "queue": backend, "roots": roots}
 
 
 @router.post("/{project_id}/upload", status_code=202)
@@ -140,8 +151,9 @@ async def upload_images(
     if not finalize:
         return {"saved": saved, "finalized": False}
 
-    job = Job(project_id=project.id, kind="scan", engine="-", options={"root": str(root)})
+    job = Job(project_id=project.id, kind="scan", engine="-", options={"roots": [str(root)]})
     db.add(job)
+    project.source_paths = [str(root)]
     project.status = ProjectStatus.SCANNING
     db.commit()
     return {"saved": saved, "finalized": True, "job_id": job.id, "queue": enqueue(job.id, "scan")}

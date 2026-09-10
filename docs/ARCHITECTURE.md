@@ -30,6 +30,7 @@ informativo (para relatório e diagnóstico), nunca como chave de agrupamento.
 | Frontend | Next.js (App Router) + TypeScript + MapLibre GL | Next dá roteamento, streaming de UI e build único; MapLibre é WebGL, licença BSD, suporta raster XYZ e vetor no mesmo canvas, e aguenta ortomosaicos grandes por tiles (Leaflet é DOM/canvas e sofre com pan em raster pesado). |
 | API | FastAPI + Pydantic v2 + Uvicorn | Tipagem estática ponta a ponta, OpenAPI automática para o cliente TS, e async nativo para streaming de progresso (SSE) e upload em chunks. |
 | Persistência | SQLAlchemy 2.0; SQLite por padrão, PostgreSQL/PostGIS quando `DATABASE_URL` aponta para Postgres | SQLite deixa o protótipo rodar sem infraestrutura. PostGIS entra quando houver consulta espacial real (interseção de voos, footprints, mapas de talhão). O código usa GeoJSON em coluna JSON, portanto a migração para `geometry` é aditiva. |
+| Qualidade | Presets alta / média / baixa em um único lugar (`processing/quality.py`) | A escolha do usuário é uma só e vale para todos os motores: controla o detalhe usado na detecção de características, quantos pares são comparados e o GSD da saída em relação ao nativo. |
 | Fila | Abstração `TaskQueue` com dois back-ends: executor local (thread + processo filho) e Celery/Redis | Processamento fotogramétrico dura horas: precisa sair do processo da API. Celery/Redis é o padrão do ecossistema Python e permite escalar workers em máquinas com GPU. O executor local existe para o desenvolvedor rodar tudo com um comando. |
 | Motor | OpenDroneMap (ODM), consumido via NodeODM (REST) ou `docker run` | Ver seção 3. |
 | Raster | GDAL / rasterio / rio-tiler / pyproj / shapely | GDAL é a referência para GeoTIFF, COG, reprojeção e overviews. rio-tiler serve tiles XYZ direto do COG sem pré-gerar pirâmide em disco. |
@@ -62,7 +63,30 @@ O motor é acessado por um **adaptador** (`processing/engines/odm_engine.py`)
 atrás da interface `PhotogrammetryEngine`. Trocar ODM por COLMAP+GDAL depois
 não toca a API nem o frontend.
 
-### Motor secundário: `direct` (ortho por georreferenciamento direto)
+### Motor `sfm` (COLMAP via pycolmap)
+
+Fotogrametria real sem Docker, em CPU: SIFT, pares candidatos escolhidos pela
+posição das fotos, SfM incremental com bundle adjustment, alinhamento do modelo
+às coordenadas das câmeras por similaridade, superfície a partir da nuvem
+esparsa e ortorretificação por projeção inversa sobre essa superfície.
+
+Duas decisões importantes:
+
+- **A intrínseca vem do EXIF e fica fixa.** Em voo nadir sobre terreno pouco
+  acidentado, focal e profundidade da cena são quase indistinguíveis: deixar a
+  autocalibração livre produzia um modelo coerente com escala errada (altura de
+  voo de 720 m em vez de 120 m). Com a focal fixa, o resíduo das posições das
+  câmeras caiu de 8,6 m para 0,15 m no voo de teste.
+- **A saída é escrita em blocos.** O ortomosaico sai no GSD nativo na qualidade
+  alta, o que passa facilmente de um gigapixel; cada bloco de 2048 px é
+  projetado, composto e gravado isoladamente, com um cache pequeno de fotos
+  decodificadas. O pico de memória depende do bloco, não do tamanho do voo.
+
+Ele não faz reconstrução densa (MVS), então a superfície é mais grosseira que a
+do ODM. Para o produto de máxima precisão o motor `odm` continua sendo a
+escolha.
+
+### Motor `direct` (projeção direta pelos metadados)
 
 Existe um segundo motor real, não um mock: ele projeta cada imagem no plano do
 terreno usando GPS, altitude relativa, distância focal, tamanho do sensor e os

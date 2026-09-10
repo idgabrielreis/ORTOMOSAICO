@@ -104,7 +104,10 @@ class Project(Base):
     status: Mapped[str] = mapped_column(String(20), default=ProjectStatus.CREATED)
 
     source_path: Mapped[str | None] = mapped_column(Text, default=None)
+    # Uma ou várias pastas escolhidas pelo usuário; todas formam o MESMO dataset.
+    source_paths: Mapped[list] = mapped_column(JSON, default=list)
     source_kind: Mapped[str] = mapped_column(String(20), default="server")  # server | upload
+    quality: Mapped[str] = mapped_column(String(10), default="alta")
 
     # CRS de saída escolhido pelo usuário (None = derivado do centroide do voo)
     output_epsg: Mapped[int | None] = mapped_column(Integer, default=None)

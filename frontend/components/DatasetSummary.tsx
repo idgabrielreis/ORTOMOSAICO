@@ -10,20 +10,19 @@ export function DatasetSummaryCard({ summary }: { summary: DatasetSummary }) {
 
   return (
     <div className="card">
-      <h2>Dataset encontrado</h2>
+      <h2>Fotos encontradas</h2>
       <p className="sub" style={{ marginBottom: 14 }}>
-        Todas as imagens abaixo pertencem ao mesmo voo e serão processadas como uma
-        única missão.
+        Todas as fotos abaixo entram no mesmo processamento e geram um único ortomosaico.
       </p>
 
       <div className="grid cols-3" style={{ marginBottom: 14 }}>
         <div className="card stat" style={{ background: "var(--panel-2)" }}>
           <div className="value">{formatNumber(summary.valid_images)}</div>
-          <div className="label">Imagens válidas</div>
+          <div className="label">Fotos válidas</div>
         </div>
         <div className="card stat" style={{ background: "var(--panel-2)" }}>
           <div className="value">{formatNumber(summary.folders)}</div>
-          <div className="label">Pastas encontradas</div>
+          <div className="label">Pastas lidas</div>
         </div>
         <div className="card stat" style={{ background: "var(--panel-2)" }}>
           <div className="value">{formatDecimal(summary.area_ha, " ha")}</div>
@@ -35,9 +34,9 @@ export function DatasetSummaryCard({ summary }: { summary: DatasetSummary }) {
         <div>
           <div className="kv"><span>Arquivos varridos</span>
             <span>{formatNumber(summary.total_files)}</span></div>
-          <div className="kv"><span>Imagens com GPS</span>
+          <div className="kv"><span>Com posição no EXIF</span>
             <span>{formatNumber(summary.images_with_gps)}</span></div>
-          <div className="kv"><span>Imagens sem GPS</span>
+          <div className="kv"><span>Sem posição no EXIF</span>
             <span>{formatNumber(summary.images_without_gps)}</span></div>
           <div className="kv"><span>Inválidas</span>
             <span>{formatNumber(summary.invalid_images)}</span></div>
@@ -56,12 +55,6 @@ export function DatasetSummaryCard({ summary }: { summary: DatasetSummary }) {
         </div>
       </div>
 
-      {summary.bands?.length ? (
-        <p className="muted" style={{ marginTop: 12, fontSize: 13 }}>
-          Bandas: {summary.bands.map((b) => `${b.band} (${b.count})`).join(", ")}
-        </p>
-      ) : null}
-
       {summary.folder_names?.length ? (
         <p className="muted" style={{ marginTop: 10, fontSize: 12 }}>
           Subpastas no dataset: {summary.folder_names.join(", ")}
@@ -70,8 +63,8 @@ export function DatasetSummaryCard({ summary }: { summary: DatasetSummary }) {
 
       {!!summary.invalid_images && (
         <div className="alert warn" style={{ marginTop: 14 }}>
-          {formatNumber(summary.invalid_images)} imagens foram ignoradas devido a problemas
-          nos arquivos. O processamento continua com as demais.
+          {formatNumber(summary.invalid_images)} fotos foram ignoradas devido a problemas nos
+          arquivos. O processamento continua com as demais.
           {summary.invalid_samples?.length ? (
             <ul style={{ margin: "8px 0 0 16px" }}>
               {summary.invalid_samples.slice(0, 5).map((item) => (
@@ -84,8 +77,8 @@ export function DatasetSummaryCard({ summary }: { summary: DatasetSummary }) {
 
       {!!summary.duplicate_images && (
         <div className="alert info" style={{ marginTop: 10 }}>
-          {formatNumber(summary.duplicate_images)} imagens duplicadas em pastas diferentes
-          entraram no dataset uma única vez.
+          {formatNumber(summary.duplicate_images)} fotos repetidas em pastas diferentes
+          entraram uma única vez.
         </div>
       )}
     </div>

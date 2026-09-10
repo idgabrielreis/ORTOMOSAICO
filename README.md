@@ -1,38 +1,55 @@
 # Ortomosaico
 
-Aplicativo web para processar imagens aéreas de drone e gerar ortomosaicos
-georreferenciados, com uma regra de domínio no centro do produto:
+Aplicativo web que transforma as fotografias de um voo de drone em um
+ortomosaico georreferenciado, com uma regra no centro do produto:
 
-> **Uma pasta raiz = um voo = um dataset = um ortomosaico.**
-> Subpastas (`CAMERA_01`, `PARTE_03`, cartões de memória) são apenas
-> organização física. O usuário aponta para a pasta do voo e o sistema encontra
-> e processa todas as imagens abaixo dela como uma única missão.
+> **As pastas escolhidas = um processamento = um ortomosaico.**
+> Uma pasta ou dez, com quantas subpastas houver: todas as fotos entram no
+> mesmo processamento fotogramétrico e saem como um único ortomosaico.
 
 Isso elimina o problema de plataformas que exigem processar uma pasta por vez e
 acabam produzindo vários mosaicos separados do mesmo voo.
 
+O fluxo é:
+
+```
+criar projeto -> nome -> qualidade -> selecionar pastas -> processar
+   -> ortomosaico -> visualizar -> exportar GeoTIFF RGB
+```
+
+O ortomosaico é calculado a partir das fotografias (detecção de
+características, correspondências, SfM, bundle adjustment, superfície e
+ortorretificação). Não é uma colagem de imagens no mapa.
+
 ## O que já funciona
 
-- Criação de projeto (voo) e ingestão por pasta do servidor ou upload da árvore
-  de pastas pelo navegador.
+- Projeto com nome e qualidade (alta, média, baixa) escolhidas na criação.
+- Seleção de uma ou várias pastas, no servidor ou por upload da árvore de
+  pastas pelo navegador; subpastas são percorridas automaticamente.
 - Descoberta recursiva com validação, deduplicação e classificação de arquivos
   corrompidos, sem interromper a varredura.
-- Leitura de EXIF e do bloco XMP da DJI: GPS, altitude relativa, ângulos de
-  gimbal, RTK, banda espectral, câmera, focal e sensor.
-- Tela “Dataset encontrado” com contagens, altitude média, área em hectares,
-  GSD, câmera e sistema de coordenadas antes de processar.
-- Processamento do voo inteiro em 8 etapas, com progresso ao vivo, tempo
-  decorrido e estimado, uso de CPU/RAM/GPU, avisos, logs e cancelamento.
-- Dois motores fotogramétricos atrás da mesma interface:
-  - **odm** — OpenDroneMap (Docker ou NodeODM): SfM, bundle adjustment, nuvem de
-    pontos, DSM/DTM, ortorretificação e blending;
-  - **direct** — georreferenciamento direto por GPS, geometria de câmera e
-    gimbal; sem SfM, com terreno plano, para pré-visualização rápida e para
-    ambientes sem Docker. O produto é um GeoTIFF real, não uma simulação.
-- Mapa estilo GIS (MapLibre) com ortomosaico em tiles XYZ, posição das câmeras,
-  footprints, limite do projeto, alternância de camadas, leitura de coordenadas
-  e medição de distância e área.
-- Exportação em GeoTIFF, PNG, KMZ, World File e relatório JSON.
+- Leitura de EXIF/XMP: câmera, focal, sensor, posição, altitude e horário.
+- Resumo antes de processar: fotos encontradas, válidas, pastas lidas,
+  resolução, câmera, GSD estimado e sistema de coordenadas.
+- Processamento em 8 etapas com progresso ao vivo, tempo decorrido e estimado,
+  uso de CPU/RAM/GPU, avisos, logs e cancelamento.
+- Três motores atrás da mesma interface:
+  - **odm** — OpenDroneMap (Docker ou NodeODM): SfM, bundle adjustment, nuvem
+    densa, DSM e ortorretificação. É o motor de maior precisão.
+  - **sfm** — COLMAP via pycolmap, em CPU e sem Docker: SIFT, pares escolhidos
+    pela posição, SfM incremental, bundle adjustment, superfície a partir da
+    nuvem esparsa e ortorretificação por projeção inversa.
+  - **direct** — projeção direta pelos metadados, sem SfM, para prévia rápida.
+- Ortomosaico gravado em blocos, sem teto de resolução: na qualidade alta a
+  saída fica no GSD nativo das fotos, e um mosaico de gigapixels não precisa
+  caber na memória.
+- Mapa (MapLibre) com ortomosaico em tiles XYZ, posição das câmeras, limite do
+  projeto, camadas alternáveis, coordenadas e medição de distância e área.
+- Exportação do ortomosaico RGB em GeoTIFF (`Orto_<projeto>.rgb.tif`), além de
+  PNG e relatório JSON.
+
+Fora do escopo desta etapa, e adiado de propósito: MDE/MDS como produto de
+primeira classe, GCP, RTK/PPK, KML de planejamento e índices de vegetação.
 
 A arquitetura, as decisões técnicas e o fluxo completo dos dados estão em
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -53,8 +70,8 @@ npm install
 npm run dev            # http://localhost:3000
 ```
 
-Sem Docker, apenas o motor `direct` fica disponível — a interface mostra isso
-explicitamente na tela de dataset.
+Sem Docker o motor `odm` fica indisponível e o `sfm` assume: a interface mostra
+qual motor está em uso e por quê.
 
 ### Ambiente completo
 

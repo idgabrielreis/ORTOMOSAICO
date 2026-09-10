@@ -14,6 +14,7 @@ from ..db import get_db
 from ..geo.crs import describe, utm_epsg
 from ..models import Image, Job, JobStatus, Product, Project, ProjectStatus
 from ..processing.engines import available_engines
+from ..processing.quality import options as quality_options
 from ..utils.images import make_thumbnail
 from ..utils.sysinfo import resource_usage
 
@@ -24,6 +25,7 @@ router = APIRouter(prefix="/api", tags=["system"])
 def system_info() -> dict:
     return {
         "engines": available_engines(),
+        "qualities": quality_options(),
         "queue_backend": settings.queue_backend,
         "storage_root": str(settings.storage_root),
         "default_engine": settings.default_engine,

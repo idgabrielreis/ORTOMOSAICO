@@ -1,6 +1,7 @@
 """Importação do voo: descoberta recursiva + metadados -> UM dataset."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from datetime import timezone
 from pathlib import Path
@@ -11,7 +12,7 @@ from ..config import settings
 from ..db import session_scope
 from ..models import Image, Project, ProjectStatus
 from ..processing.reporter import JobReporter
-from .discovery import discover_images
+from .discovery import discover_dataset
 from .metadata import read_metadata
 from .summary import build_summary
 
@@ -24,11 +25,15 @@ def _workers() -> int:
     return settings.metadata_workers or min(8, os.cpu_count() or 2)
 
 
-def import_flight(project_id: str, root: Path | str, reporter: JobReporter) -> dict:
-    """Varre `root` inteira e grava as imagens como um único dataset do projeto."""
-    root = Path(root)
+def import_flight(
+    project_id: str, roots: Sequence[Path | str] | Path | str, reporter: JobReporter
+) -> dict:
+    """Varre todas as pastas escolhidas e grava UM dataset para o projeto."""
+    if isinstance(roots, (str, Path)):
+        roots = [roots]
+    roots = [Path(item) for item in roots]
     reporter.progress(1, 0.0, "Procurando imagens", force=True)
-    reporter.log(f"varrendo {root}")
+    reporter.log("varrendo: " + ", ".join(str(item) for item in roots))
 
     def on_progress(found: int, scanned: int) -> None:
         reporter.progress(
@@ -37,7 +42,7 @@ def import_flight(project_id: str, root: Path | str, reporter: JobReporter) -> d
             images_total=found,
         )
 
-    result = discover_images(root, progress=on_progress)
+    result = discover_dataset(roots, progress=on_progress)
     reporter.log(
         f"{len(result.files)} arquivos de imagem em {len(result.folders)} pastas; "
         f"{len(result.valid)} válidos, {len(result.invalid)} inválidos, "
@@ -123,6 +128,7 @@ def import_flight(project_id: str, root: Path | str, reporter: JobReporter) -> d
         images = db.query(Image).filter(Image.project_id == project_id).all()
         summary = build_summary(images, folders=len(result.folders))
         summary["root"] = str(result.root)
+        summary["roots"] = [str(item) for item in result.roots]
         summary["scanned_entries"] = result.scanned_entries
         summary["skipped_extensions"] = result.skipped_extensions
 
@@ -130,6 +136,7 @@ def import_flight(project_id: str, root: Path | str, reporter: JobReporter) -> d
         if project:
             project.summary = summary
             project.source_path = str(result.root)
+            project.source_paths = [str(item) for item in result.roots]
             project.status = ProjectStatus.READY
 
     reporter.progress(2, 1.0, "Dataset montado", force=True)

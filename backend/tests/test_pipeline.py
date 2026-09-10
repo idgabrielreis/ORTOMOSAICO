@@ -40,7 +40,7 @@ def test_importacao_cria_um_unico_dataset(projeto_importado: str):
     assert summary["folders"] >= 3
     assert summary["area_ha"] > 0
     assert summary["epsg"] and 32700 <= summary["epsg"] < 32800  # UTM sul
-    assert summary["mean_relative_altitude_m"] == 110.0
+    assert 105.0 < summary["mean_relative_altitude_m"] < 115.0
 
 
 def test_ortomosaico_gerado_e_georreferenciado(projeto_importado: str):
@@ -74,6 +74,36 @@ def test_ortomosaico_gerado_e_georreferenciado(projeto_importado: str):
             # imagem isolada.
             largura_m = src.width * abs(src.transform.a)
             assert largura_m > 100
+
+
+def test_varias_pastas_selecionadas_viram_um_dataset_so(db_session, flight_dir: Path):
+    """Selecionar N pastas não cria N projetos: cria um dataset só."""
+    partes = sorted(p for p in flight_dir.iterdir() if p.is_dir() and p.name.startswith("PARTE"))
+    assert len(partes) >= 2
+
+    with session_scope() as db:
+        project = Project(name="Voo em partes")
+        db.add(project)
+        db.flush()
+        job = Job(
+            project_id=project.id, kind="scan",
+            options={"roots": [str(parte) for parte in partes]},
+        )
+        db.add(job)
+        db.flush()
+        project_id, job_id = project.id, job.id
+
+    run_scan_job(job_id)
+
+    with session_scope() as db:
+        images = db.query(Image).filter(Image.project_id == project_id).all()
+        summary = db.get(Project, project_id).summary
+
+    assert {i.project_id for i in images} == {project_id}
+    # Cada pasta escolhida vira prefixo, mas todas as fotos são do mesmo dataset.
+    assert {i.relative_path.split("/")[0] for i in images} == {p.name for p in partes}
+    assert summary["valid_images"] == len([i for i in images if i.is_valid and not i.is_duplicate])
+    assert len(summary["roots"]) == len(partes)
 
 
 def test_avisos_listam_arquivos_ignorados(projeto_importado: str):

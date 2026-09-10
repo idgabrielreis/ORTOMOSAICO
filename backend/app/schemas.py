@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class ProjectCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = ""
+    quality: str = "alta"
     source_path: str | None = None
     output_epsg: int | None = None
     target_gsd_cm: float | None = Field(default=None, gt=0, le=100)
@@ -17,6 +18,7 @@ class ProjectCreate(BaseModel):
 class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+    quality: str | None = None
     output_epsg: int | None = None
     target_gsd_cm: float | None = None
 
@@ -29,7 +31,9 @@ class ProjectOut(BaseModel):
     description: str
     status: str
     source_path: str | None
+    source_paths: list
     source_kind: str
+    quality: str
     output_epsg: int | None
     target_gsd_cm: float | None
     summary: dict
@@ -38,14 +42,21 @@ class ProjectOut(BaseModel):
 
 
 class ScanRequest(BaseModel):
-    path: str = Field(description="Pasta raiz do voo no servidor; subpastas entram no mesmo dataset")
+    """Uma ou várias pastas. Todas juntas formam um único dataset."""
+
+    paths: list[str] = Field(default_factory=list)
+    path: str | None = None  # forma antiga, com uma pasta só
+
+    def all_paths(self) -> list[str]:
+        chosen = [item.strip() for item in (self.paths or []) if item and item.strip()]
+        if self.path and self.path.strip():
+            chosen.append(self.path.strip())
+        return list(dict.fromkeys(chosen))
 
 
 class JobCreate(BaseModel):
     engine: str = "auto"
-    quality: str = "medium"
-    fast_orthophoto: bool = True
-    multispectral: bool = False
+    quality: str | None = None  # vazio usa a qualidade escolhida no projeto
     options: dict = Field(default_factory=dict)
 
 

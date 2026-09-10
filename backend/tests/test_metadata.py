@@ -29,7 +29,8 @@ def test_le_xmp_da_dji(flight_dir: Path):
     meta = read_metadata(path)
 
     assert "RelativeAltitude" in xmp
-    assert meta["relative_altitude"] == 110.0
+    # O voo simulado tem variação de altura, como um voo real.
+    assert 105.0 < meta["relative_altitude"] < 115.0
     assert meta["pitch"] == -90.0  # gimbal em nadir
 
 

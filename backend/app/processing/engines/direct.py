@@ -105,9 +105,11 @@ class DirectGeoreferencingEngine:
         ys = [y for _, corners, _ in quads for _, y in corners]
         minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
 
-        gsd = (ctx.target_gsd_cm / 100) if ctx.target_gsd_cm else statistics.fmean(
-            g for _, _, g in quads
-        )
+        from ..quality import preset as quality_preset
+
+        preset = quality_preset(ctx.options.get("quality"))
+        native_gsd = statistics.fmean(g for _, _, g in quads)
+        gsd = (ctx.target_gsd_cm / 100) if ctx.target_gsd_cm else native_gsd * preset["gsd_factor"]
         width = int(math.ceil((maxx - minx) / gsd))
         height = int(math.ceil((maxy - miny) / gsd))
         if width * height > MAX_OUTPUT_PIXELS:

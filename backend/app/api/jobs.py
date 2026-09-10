@@ -14,6 +14,7 @@ from ..config import settings
 from ..db import SessionLocal, get_db
 from ..models import Image, Job, JobStatus, Project, ProjectStatus
 from ..processing.engines import resolve_engine
+from ..processing.quality import resolve_quality
 from ..processing.queue import enqueue
 from ..schemas import JobCreate, JobOut
 from ..utils.sysinfo import resource_usage
@@ -50,16 +51,12 @@ def create_job(project_id: str, payload: JobCreate, db: Session = Depends(get_db
     if not available:
         raise HTTPException(400, f"motor {engine.name} indisponível: {reason}")
 
+    quality = resolve_quality(payload.quality or project.quality)
     job = Job(
         project_id=project_id,
         kind="orthomosaic",
         engine=engine.name,
-        options={
-            "quality": payload.quality,
-            "fast_orthophoto": payload.fast_orthophoto,
-            "multispectral": payload.multispectral,
-            **payload.options,
-        },
+        options={"quality": quality, **payload.options},
     )
     db.add(job)
     project.status = ProjectStatus.PROCESSING

@@ -59,12 +59,7 @@ export default function ProjectPage() {
     setBusy(true);
     setError(null);
     try {
-      await api.startProcessing(projectId, {
-        engine: "auto",
-        quality: "medium",
-        fast_orthophoto: true,
-        multispectral: (project?.summary.bands?.length ?? 0) > 1,
-      });
+      await api.startProcessing(projectId, { engine: "auto", quality: project?.quality });
       await load();
       setTab("processamento");
     } catch (e) {
@@ -84,10 +79,16 @@ export default function ProjectPage() {
         <div>
           <h1>{project.name}</h1>
           <p className="sub">
-            {project.source_path} · {formatNumber(project.summary.valid_images)} imagens em{" "}
-            {formatNumber(project.summary.folders)} pastas · criado em{" "}
-            {formatDate(project.created_at)}
+            {formatNumber(project.summary.valid_images)} fotos em{" "}
+            {formatNumber(project.summary.folders)} pastas · qualidade {project.quality} ·
+            criado em {formatDate(project.created_at)}
           </p>
+          {project.source_paths?.length > 1 && (
+            <p className="muted" style={{ fontSize: 12 }}>
+              {project.source_paths.length} pastas selecionadas, processadas como um único
+              conjunto
+            </p>
+          )}
         </div>
         <div className="row">
           <span className={`badge ${completed ? "ok" : activeJob ? "run" : ""}`}>

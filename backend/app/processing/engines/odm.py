@@ -22,6 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from ...config import settings
+from ..quality import preset as quality_preset
 from .base import EngineContext, EngineResult, EngineUnavailable
 
 # Trechos do log do ODM -> (etapa da UI, fração aproximada da etapa)
@@ -104,7 +105,7 @@ class ODMEngine:
             args += ["--orthophoto-resolution", f"{ctx.target_gsd_cm:.2f}"]
         if ctx.output_epsg:
             args += ["--force-gps"] if ctx.options.get("force_gps") else []
-        quality = ctx.options.get("quality", "medium")
+        quality = quality_preset(ctx.options.get("quality"))["odm_quality"]
         args += ["--feature-quality", quality, "--pc-quality", quality]
         if ctx.options.get("fast_orthophoto", True):
             # DSM a partir de malha 2.5D: bem mais rápido, precisão suficiente
@@ -155,7 +156,12 @@ class ODMEngine:
         import httpx
 
         base = settings.nodeodm_url.rstrip("/")
-        options = [{"name": "orthophoto-resolution", "value": ctx.target_gsd_cm or 5}]
+        preset = quality_preset(ctx.options.get("quality"))
+        options = [
+            {"name": "orthophoto-resolution", "value": ctx.target_gsd_cm or 2},
+            {"name": "feature-quality", "value": preset["odm_quality"]},
+            {"name": "pc-quality", "value": preset["odm_quality"]},
+        ]
         if ctx.options.get("fast_orthophoto", True):
             options.append({"name": "fast-orthophoto", "value": True})
 

@@ -66,10 +66,10 @@ def run_scan_job(job_id: str) -> None:
     _, _, log_path = _job_paths(project_id, job_id)
     reporter = JobReporter(job_id, log_path)
     try:
-        root = options.get("root")
-        if not root:
-            raise ValueError("caminho da pasta do voo não informado")
-        import_flight(project_id, root, reporter)
+        roots = options.get("roots") or ([options["root"]] if options.get("root") else [])
+        if not roots:
+            raise ValueError("nenhuma pasta de imagens informada")
+        import_flight(project_id, roots, reporter)
         _finish(job_id, JobStatus.SUCCEEDED)
         with session_scope() as db:
             project = db.get(Project, project_id)
@@ -145,6 +145,7 @@ def run_orthomosaic_job(job_id: str) -> None:
             valid = [i for i in all_images if i.is_valid and not i.is_duplicate]
             output_epsg = project.output_epsg
             target_gsd = project.target_gsd_cm
+            options.setdefault("quality", project.quality or "alta")
 
         total, usable = len(all_images), len(valid)
         if usable < settings.min_valid_images:

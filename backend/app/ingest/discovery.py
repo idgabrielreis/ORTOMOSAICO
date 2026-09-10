@@ -11,7 +11,7 @@ travam nem estouram a pilha do Python.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,6 +68,7 @@ class AuxiliaryFile:
 @dataclass
 class DiscoveryResult:
     root: Path
+    roots: list[Path] = field(default_factory=list)
     files: list[FoundFile] = field(default_factory=list)
     folders: set[str] = field(default_factory=set)
     auxiliary: list[AuxiliaryFile] = field(default_factory=list)
@@ -146,18 +147,73 @@ def discover_images(
     progress_every: int = 200,
 ) -> DiscoveryResult:
     """Varre `root` e devolve UM dataset com todas as imagens abaixo dela."""
-    root = Path(root).expanduser().resolve()
-    if not root.is_dir():
-        raise NotADirectoryError(f"{root} não é um diretório")
+    return discover_dataset(
+        [root], progress=progress, validate=validate,
+        deduplicate=deduplicate, progress_every=progress_every,
+    )
 
-    result = DiscoveryResult(root=root)
+
+def discover_dataset(
+    roots: Sequence[Path | str],
+    *,
+    progress: ProgressCB | None = None,
+    validate: bool = True,
+    deduplicate: bool = True,
+    progress_every: int = 200,
+) -> DiscoveryResult:
+    """Junta uma ou várias pastas em UM único dataset.
+
+    Selecionar cinco pastas não cria cinco projetos: as imagens de todas elas
+    entram na mesma lista, com a mesma deduplicação, e seguem para um único
+    processamento. Quando há mais de uma raiz, o nome da pasta escolhida vira
+    prefixo do caminho relativo, apenas para o usuário saber de onde veio cada
+    foto.
+    """
+    resolved: list[Path] = []
+    for candidate in roots:
+        path = Path(candidate).expanduser().resolve()
+        if not path.is_dir():
+            raise NotADirectoryError(f"{path} não é um diretório")
+        if path not in resolved:
+            resolved.append(path)
+    if not resolved:
+        raise ValueError("nenhuma pasta selecionada")
+
+    result = DiscoveryResult(root=resolved[0], roots=resolved)
     by_signature: dict[str, FoundFile] = {}
+    multiple = len(resolved) > 1
+
+    for root in resolved:
+        _scan_root(
+            root, result, by_signature,
+            prefix=root.name if multiple else "",
+            progress=progress, validate=validate,
+            deduplicate=deduplicate, progress_every=progress_every,
+        )
+
+    if progress:
+        progress(len(result.files), result.scanned_entries)
+    return result
+
+
+def _scan_root(
+    root: Path,
+    result: DiscoveryResult,
+    by_signature: dict[str, FoundFile],
+    *,
+    prefix: str,
+    progress: ProgressCB | None,
+    validate: bool,
+    deduplicate: bool,
+    progress_every: int,
+) -> None:
+    base_scanned = result.scanned_entries
 
     for path, st, scanned in walk_image_files(root):
-        result.scanned_entries = scanned
+        result.scanned_entries = base_scanned + scanned
         ext = path.suffix.lower()
         if ext not in IMAGE_EXTENSIONS:
-            rel_aux = path.relative_to(root).as_posix()
+            rel_aux = _relative(path, root, prefix)
             kind = AUXILIARY_EXTENSIONS.get(ext)
             if kind:
                 result.auxiliary.append(
@@ -173,7 +229,7 @@ def discover_images(
                 result.skipped_extensions[ext] = result.skipped_extensions.get(ext, 0) + 1
             continue
 
-        rel = path.relative_to(root).as_posix()
+        rel = _relative(path, root, prefix)
         folder = str(Path(rel).parent) if "/" in rel else "."
         found = FoundFile(
             path=path,
@@ -194,9 +250,10 @@ def discover_images(
         if progress and len(result.files) % progress_every == 0:
             progress(len(result.files), result.scanned_entries)
 
-    if progress:
-        progress(len(result.files), result.scanned_entries)
-    return result
+
+def _relative(path: Path, root: Path, prefix: str) -> str:
+    relative = path.relative_to(root).as_posix()
+    return f"{prefix}/{relative}" if prefix else relative
 
 
 def _validate(found: FoundFile) -> None:

@@ -9,7 +9,9 @@ export interface Project {
   description: string;
   status: ProjectStatus;
   source_path: string | null;
+  source_paths: string[];
   source_kind: string;
+  quality: string;
   output_epsg: number | null;
   target_gsd_cm: number | null;
   summary: DatasetSummary;
@@ -86,6 +88,12 @@ export interface JobEvent {
   };
 }
 
+export interface Quality {
+  value: string;
+  label: string;
+  summary: string;
+}
+
 export interface Engine {
   name: string;
   description: string;
@@ -123,7 +131,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   stats: () => request<DashboardStats>("/api/stats"),
-  systemInfo: () => request<{ engines: Engine[]; queue_backend: string }>("/api/system/info"),
+  systemInfo: () =>
+    request<{ engines: Engine[]; qualities: Quality[]; queue_backend: string }>(
+      "/api/system/info",
+    ),
   browse: (path?: string) =>
     request<{ path: string; parent: string; entries: { name: string; path: string }[] }>(
       `/api/system/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`,
@@ -131,15 +142,16 @@ export const api = {
 
   projects: () => request<Project[]>("/api/projects"),
   project: (id: string) => request<Project>(`/api/projects/${id}`),
-  createProject: (body: { name: string; description?: string; output_epsg?: number | null;
-                          target_gsd_cm?: number | null }) =>
+  createProject: (body: { name: string; description?: string; quality?: string;
+                          output_epsg?: number | null; target_gsd_cm?: number | null }) =>
     request<Project>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
   deleteProject: (id: string) => request<void>(`/api/projects/${id}`, { method: "DELETE" }),
 
-  scan: (id: string, path: string) =>
-    request<{ job_id: string; root: string }>(`/api/projects/${id}/scan`, {
+  /** Uma ou várias pastas; todas formam um único dataset. */
+  scan: (id: string, paths: string[]) =>
+    request<{ job_id: string; roots: string[] }>(`/api/projects/${id}/scan`, {
       method: "POST",
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ paths }),
     }),
   summary: (id: string) => request<DatasetSummary>(`/api/projects/${id}/summary`),
   folders: (id: string) => request<{ folder: string; images: number }[]>(
@@ -148,8 +160,7 @@ export const api = {
   job: (jobId: string) => request<Job>(`/api/jobs/${jobId}`),
   jobLog: (jobId: string) => fetch(`/api/jobs/${jobId}/log`).then((r) => r.text()),
   cancelJob: (jobId: string) => request<Job>(`/api/jobs/${jobId}/cancel`, { method: "POST" }),
-  startProcessing: (id: string, body: { engine: string; quality: string;
-                                        fast_orthophoto: boolean; multispectral: boolean }) =>
+  startProcessing: (id: string, body: { engine?: string; quality?: string }) =>
     request<Job>(`/api/projects/${id}/jobs`, { method: "POST", body: JSON.stringify(body) }),
 
   rasterInfo: (id: string) =>

@@ -28,6 +28,7 @@ from pathlib import Path
 import numpy as np
 
 from ...geo.crs import from_utm, to_utm, utm_epsg
+from ..quality import preset as quality_preset
 from .base import EngineContext, EngineResult, EngineUnavailable, ImageRef
 
 # O ortomosaico sai no GSD nativo do voo. Não existe teto de resolução: um voo
@@ -42,8 +43,7 @@ SAFETY_MAX_PIXELS = 8_000_000_000 # guarda contra parâmetro absurdo (não é li
 # densidade para isso, e uma grade mais grossa é mais estável e muito mais leve.
 DSM_GSD_FACTOR = 8
 
-NEIGHBORS_PER_IMAGE = 12          # pares candidatos por imagem, escolhidos por GPS
-MAX_FEATURE_IMAGE_SIZE = 2400     # só para detectar features; não afeta a saída
+NEIGHBORS_PER_IMAGE = 12          # padrão de pares por imagem; o preset de qualidade ajusta
 DSM_SMOOTH_ITERATIONS = 2
 
 
@@ -328,6 +328,8 @@ class SfmEngine:
         from rasterio.transform import from_origin
 
         warnings: list[str] = []
+        preset = quality_preset(ctx.options.get("quality"))
+        ctx.log(f"qualidade: {preset['label']} — {preset['summary']}")
         images = _usable(ctx.images)
         if len(images) < 5:
             raise EngineUnavailable("o motor sfm precisa de ao menos 5 imagens com GPS")
@@ -349,8 +351,8 @@ class SfmEngine:
         # ------------------------------------------------------------ features
         ctx.progress(3, 0.05, "Detectando características (SIFT)")
         extraction = pycolmap.FeatureExtractionOptions()
-        extraction.max_image_size = MAX_FEATURE_IMAGE_SIZE
-        extraction.sift.max_num_features = 8192
+        extraction.max_image_size = preset["feature_max_size"]
+        extraction.sift.max_num_features = preset["max_features"]
 
         # Intrínseca vinda do EXIF. Em voo nadir sobre terreno pouco acidentado,
         # focal e profundidade da cena são quase indistinguíveis: deixar a
@@ -395,7 +397,7 @@ class SfmEngine:
 
         # ------------------------------------------------------------- matching
         ctx.progress(4, 0.1, "Selecionando pares pelo GPS")
-        pairs = _gps_pairs(images, epsg)
+        pairs = _gps_pairs(images, epsg, neighbors=preset["neighbors"])
         pairs_file = work / "pairs.txt"
         pairs_file.write_text("\n".join(f"{a} {b}" for a, b in pairs), encoding="utf-8")
         ctx.log(
@@ -493,10 +495,12 @@ class SfmEngine:
 
         first = next(iter(reconstruction.images.values()))
         camera = reconstruction.cameras[first.camera_id]
-        gsd = (
-            ctx.target_gsd_cm / 100
-            if ctx.target_gsd_cm
-            else flight_height / camera.mean_focal_length()
+        # GSD nativo do voo: altura de voo dividida pela focal em pixels.
+        native_gsd = flight_height / camera.mean_focal_length()
+        gsd = (ctx.target_gsd_cm / 100) if ctx.target_gsd_cm else native_gsd * preset["gsd_factor"]
+        ctx.log(
+            f"GSD nativo {native_gsd * 100:.2f} cm/px; saída {gsd * 100:.2f} cm/px "
+            f"(qualidade {preset['label']})"
         )
 
         minx, maxx = float(points[:, 0].min()), float(points[:, 0].max())
@@ -687,6 +691,8 @@ class SfmEngine:
                 "gps_rms_m": rms,
                 "canvas_px": [width, height],
                 "megapixels": round(width * height / 1e6, 1),
+                "native_gsd_cm": round(native_gsd * 100, 2),
+                "quality": preset["label"],
                 "dsm_gsd_cm": round(dsm_gsd * 100, 1),
                 "coverage_percent": coverage_percent,
                 "elevation_min_m": round(float(np.percentile(elevations, 1)), 2)

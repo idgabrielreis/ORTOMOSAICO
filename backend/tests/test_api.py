@@ -83,3 +83,23 @@ def test_system_info_lista_motores(client: TestClient):
 
     nomes = {engine["name"] for engine in payload["engines"]}
     assert {"odm", "direct"} <= nomes
+
+
+def test_qualidade_do_projeto_vale_para_o_job(client: TestClient, flight_dir: Path):
+    """A qualidade é escolhida na criação do projeto e o job herda essa escolha."""
+    project_id = client.post(
+        "/api/projects", json={"name": "Voo qualidade baixa", "quality": "baixa"}
+    ).json()["id"]
+    scan = client.post(f"/api/projects/{project_id}/scan", json={"paths": [str(flight_dir)]})
+    _esperar_job(client, scan.json()["job_id"])
+
+    job = client.post(f"/api/projects/{project_id}/jobs", json={"engine": "direct"})
+
+    assert job.status_code == 202
+    assert client.get(f"/api/projects/{project_id}").json()["quality"] == "baixa"
+
+
+def test_system_info_lista_qualidades(client: TestClient):
+    payload = client.get("/api/system/info").json()
+
+    assert {q["value"] for q in payload["qualities"]} == {"alta", "media", "baixa"}
