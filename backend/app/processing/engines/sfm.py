@@ -118,6 +118,17 @@ def _gps_pairs(
     return sorted(pairs)
 
 
+def _fit_plane(points: np.ndarray) -> tuple[float, float, float]:
+    """Plano médio do terreno, z = a·x + b·y + c, por mínimos quadrados."""
+    origin = points.mean(axis=0)
+    design = np.column_stack(
+        [points[:, 0] - origin[0], points[:, 1] - origin[1], np.ones(len(points))]
+    )
+    coefficients, *_ = np.linalg.lstsq(design, points[:, 2], rcond=None)
+    a, b, c = coefficients
+    return float(a), float(b), float(c - a * origin[0] - b * origin[1])
+
+
 def _build_dsm(
     points: np.ndarray, minx: float, maxy: float, gsd: float, width: int, height: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -142,6 +153,14 @@ def _build_dsm(
     if not valid.any():
         raise EngineUnavailable("a reconstrução não gerou pontos suficientes para o MDS")
 
+    # Fora da área medida, o terreno vira o plano médio ajustado à nuvem. Propagar
+    # cotas para longe curvaria a superfície e entortaria a ortorretificação.
+    a, b, c = _fit_plane(points)
+    grid_x = minx + (np.arange(width, dtype=np.float64) + 0.5) * gsd
+    grid_y = maxy - (np.arange(height, dtype=np.float64) + 0.5) * gsd
+    plane = (a * grid_x[None, :] + b * grid_y[:, None] + c).astype(np.float32)
+    dsm = np.where(valid, dsm, np.nan)
+
     # Preenchimento por vizinhança: propaga as cotas conhecidas para os vazios.
     filled = np.where(valid, dsm, 0).astype(np.float32)
     weight = valid.astype(np.float32)
@@ -156,7 +175,12 @@ def _build_dsm(
         weight = known.astype(np.float32)
         filled = np.where(valid, dsm, filled)
 
-    surface = np.where(valid, dsm, filled).astype(np.float32)
+    # Mistura suave entre o medido (perto dos pontos) e o plano (longe deles).
+    distance = cv2.distanceTransform(
+        (~valid).astype(np.uint8), cv2.DIST_L2, 3
+    ).astype(np.float32)
+    blend = np.clip(distance / max(8.0, 0.02 * max(width, height)), 0.0, 1.0)
+    surface = np.where(valid, dsm, filled * (1 - blend) + plane * blend).astype(np.float32)
     for _ in range(DSM_SMOOTH_ITERATIONS):
         surface = cv2.GaussianBlur(surface, (5, 5), 0)
     surface = np.where(valid, dsm, surface).astype(np.float32)
@@ -309,7 +333,10 @@ class _View:
     east: float = 0.0
     north: float = 0.0
 
-    def compute_extent(self, z_reference: float, z_min: float, z_max: float) -> None:
+    def compute_extent(
+        self, z_reference: float, z_min: float, z_max: float,
+        max_incidence_deg: float = 60.0,
+    ) -> None:
         """Área do solo que esta foto pode enxergar.
 
         Os quatro cantos da imagem são traçados como raios e intersectados com
@@ -341,13 +368,32 @@ class _View:
         self.west, self.east = float(array[:, 0].min()), float(array[:, 0].max())
         self.south, self.north = float(array[:, 1].min()), float(array[:, 1].max())
 
+        # Além do limite de incidência a foto não contribui, então esse trecho
+        # de terreno não pertence ao footprint útil desta imagem.
+        reach = max(self.center[2] - z_reference, 1.0) * math.tan(
+            math.radians(max_incidence_deg)
+        )
+        self.west = max(self.west, self.center[0] - reach)
+        self.east = min(self.east, self.center[0] + reach)
+        self.south = max(self.south, self.center[1] - reach)
+        self.north = min(self.north, self.center[1] + reach)
+
     def intersects(self, west: float, south: float, east: float, north: float) -> bool:
         return not (
             self.east < west or self.west > east or self.north < south or self.south > north
         )
 
+    def off_nadir_degrees(self) -> float:
+        """Quanto o eixo óptico se afasta da vertical, em graus."""
+        axis = self.cam_from_world[2, :3]
+        norm = np.linalg.norm(axis)
+        if norm < 1e-9:
+            return 0.0
+        return float(math.degrees(math.acos(min(1.0, abs(axis[2]) / norm))))
+
     def sample(
-        self, world: np.ndarray, shape: tuple[int, int], cache: _ImageCache
+        self, world: np.ndarray, shape: tuple[int, int], cache: _ImageCache,
+        max_incidence_cos: float = 0.42,
     ) -> tuple[np.ndarray | None, np.ndarray]:
         """Projeta os pontos do bloco nesta foto e devolve cor e peso.
 
@@ -368,6 +414,17 @@ class _View:
 
         in_camera = world @ rotation.T + translation
         visible = in_camera[:, 2] > 1e-6
+        if not visible.any():
+            return None, np.zeros(shape, dtype=np.float32)
+
+        # Ângulo com que a visada chega ao solo. Perto da vertical o pixel do
+        # solo é bem amostrado; muito inclinado, um pixel da foto cobre metros
+        # de terreno e a projeção fica esticada. É o que produz o rastro
+        # borrado nas bordas de fotos oblíquas.
+        ray = world - self.center
+        distance = np.linalg.norm(ray, axis=1)
+        incidence_cos = np.abs(ray[:, 2]) / np.maximum(distance, 1e-9)
+        visible &= incidence_cos >= max_incidence_cos
         if not visible.any():
             return None, np.zeros(shape, dtype=np.float32)
 
@@ -399,6 +456,8 @@ class _View:
             + ((py - center_y) / (source.shape[0] / 2)) ** 2
         )
         weight = np.clip(1.15 - normalized, 0.0, 1.0) ** 2
+        # Visada mais próxima da vertical vale mais na composição.
+        weight = weight * incidence_cos**2
         weight = np.where(inside, weight, 0.0).astype(np.float32).reshape(shape)
         return sampled, weight
 
@@ -705,11 +764,42 @@ class SfmEngine:
                 cam_from_world=colmap_image.cam_from_world().matrix(),
                 center=np.asarray(colmap_image.projection_center(), dtype=np.float64),
             )
-            view.compute_extent(elevation_reference, float(points[:, 2].min()),
-                                float(points[:, 2].max()))
             views.append(view)
         if not views:
             raise EngineUnavailable("nenhuma fotografia alinhada pôde ser ortorretificada")
+
+        off_nadir = [view.off_nadir_degrees() for view in views]
+        median_off_nadir = statistics.median(off_nadir) if off_nadir else 0.0
+        # Em voo nadir corta-se a partir de 55°; em voo oblíquo o limite
+        # acompanha a inclinação real, senão não sobraria pixel algum.
+        max_incidence_deg = min(70.0, max(55.0, median_off_nadir + 15.0))
+        max_incidence_cos = math.cos(math.radians(max_incidence_deg))
+        ctx.log(
+            f"inclinação das fotos: {median_off_nadir:.1f}° do nadir; "
+            f"visadas aceitas até {max_incidence_deg:.0f}°"
+        )
+        if median_off_nadir > 20:
+            warnings.append(
+                f"as fotografias estão a {median_off_nadir:.0f}° do nadir (captura oblíqua). "
+                "O ortomosaico sai com resolução desigual e cobertura em leque; para "
+                "mapeamento, o gimbal deve estar a -90°"
+            )
+
+        for view in views:
+            view.compute_extent(
+                elevation_reference, float(points[:, 2].min()), float(points[:, 2].max()),
+                max_incidence_deg,
+            )
+
+        # A tela do ortomosaico é a união dos footprints úteis, não a extensão
+        # inteira da nuvem: sem isso sobra área vazia em volta do produto.
+        minx = max(minx, min(view.west for view in views))
+        maxx = min(maxx, max(view.east for view in views))
+        miny = max(miny, min(view.south for view in views))
+        maxy = min(maxy, max(view.north for view in views))
+        width = max(1, int(math.ceil((maxx - minx) / gsd)))
+        height = max(1, int(math.ceil((maxy - miny) / gsd)))
+        ctx.log(f"tela recortada para {width}x{height} px pela cobertura útil das fotos")
 
         cache = _ImageCache(IMAGE_CACHE_SIZE)
         coverage_pixels = 0
@@ -771,7 +861,9 @@ class SfmEngine:
                     accumulator = np.zeros((tile_h, tile_w, 3), dtype=np.float32)
                     weights = np.zeros((tile_h, tile_w), dtype=np.float32)
                     for view in visible:
-                        sampled, weight = view.sample(world, (tile_h, tile_w), cache)
+                        sampled, weight = view.sample(
+                            world, (tile_h, tile_w), cache, max_incidence_cos
+                        )
                         if sampled is None:
                             continue
                         accumulator += sampled * weight[..., None]
@@ -852,6 +944,8 @@ class SfmEngine:
                 "megapixels": round(width * height / 1e6, 1),
                 "native_gsd_cm": round(native_gsd * 100, 2),
                 "quality": preset["label"],
+                "off_nadir_deg": round(median_off_nadir, 1),
+                "max_incidence_deg": round(max_incidence_deg, 1),
                 "dsm_gsd_cm": round(dsm_gsd * 100, 1),
                 "coverage_percent": coverage_percent,
                 "elevation_min_m": round(float(np.percentile(elevations, 1)), 2)
