@@ -1,7 +1,7 @@
 "use client";
 
-import { useParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useState } from "react";
 
 import { DatasetSummaryCard } from "@/components/DatasetSummary";
 import { ExportPanel } from "@/components/ExportPanel";
@@ -12,9 +12,8 @@ import { STATUS_LABEL, formatDate, formatNumber } from "@/lib/format";
 
 type Tab = "dataset" | "processamento" | "mapa" | "exportacao";
 
-export default function ProjectPage() {
-  const params = useParams<{ id: string }>();
-  const projectId = params.id;
+function ProjectView() {
+  const projectId = useSearchParams().get("id") ?? "";
   const [project, setProject] = useState<Project | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [engines, setEngines] = useState<Engine[]>([]);
@@ -184,5 +183,14 @@ export default function ProjectPage() {
         )
       )}
     </>
+  );
+}
+
+export default function ProjectPage() {
+  // useSearchParams exige Suspense na exportação estática.
+  return (
+    <Suspense fallback={<p className="muted">Carregando projeto…</p>}>
+      <ProjectView />
+    </Suspense>
   );
 }

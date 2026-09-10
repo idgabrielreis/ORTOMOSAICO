@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,3 +97,27 @@ except ImportError as exc:  # pragma: no cover
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+def _mount_web_interface() -> None:
+    """Serve a interface junto com a API, quando ela vem compilada.
+
+    No modo executável não existe Node na máquina do usuário: o frontend é
+    exportado como arquivos estáticos e servido aqui, na mesma porta da API.
+    Em desenvolvimento nada é montado e o Next continua servindo a interface.
+    """
+    from fastapi.staticfiles import StaticFiles
+
+    candidates = [
+        Path(settings.web_dir) if settings.web_dir else None,
+        Path(getattr(sys, "_MEIPASS", "")) / "web" if getattr(sys, "_MEIPASS", "") else None,
+        Path(__file__).resolve().parents[2] / "frontend" / "out",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_dir() and (candidate / "index.html").exists():
+            app.mount("/", StaticFiles(directory=str(candidate), html=True), name="web")
+            logging.getLogger(__name__).info("interface servida de %s", candidate)
+            return
+
+
+_mount_web_interface()

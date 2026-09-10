@@ -17,3 +17,8 @@ storage/
 
 # Sistema
 .DS_Store
+
+# Empacotamento
+backend/build/
+backend/dist/
+frontend/out/

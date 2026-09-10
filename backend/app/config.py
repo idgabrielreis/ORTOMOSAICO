@@ -39,6 +39,8 @@ class Settings(BaseSettings):
 
     # API
     cors_origins: str = "*"
+    # Pasta com a interface compilada; vazio deixa o app procurar sozinho.
+    web_dir: str = ""
 
     @property
     def sqlalchemy_url(self) -> str:

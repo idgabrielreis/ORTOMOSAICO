@@ -39,7 +39,7 @@ export default function ProjectsPage() {
             {projects.map((project) => (
               <tr key={project.id}>
                 <td>
-                  <Link href={`/projects/${project.id}`}>{project.name}</Link>
+                  <Link href={`/project?id=${project.id}`}>{project.name}</Link>
                   <div className="muted" style={{ fontSize: 12 }}>{project.source_path}</div>
                 </td>
                 <td><span className="badge">{STATUS_LABEL[project.status]}</span></td>

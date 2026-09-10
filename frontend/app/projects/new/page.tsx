@@ -115,7 +115,7 @@ export default function NewProjectPage() {
     setBusy(true);
     try {
       await api.startProcessing(projectId, { engine: "auto", quality });
-      router.push(`/projects/${projectId}`);
+      router.push(`/project?id=${projectId}`);
     } catch (e) {
       setError((e as Error).message);
       setBusy(false);

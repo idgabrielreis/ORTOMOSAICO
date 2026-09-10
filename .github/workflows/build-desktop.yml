@@ -1,0 +1,58 @@
+name: Executável
+
+# Compila o aplicativo para Windows e publica o arquivo para download.
+# Roda em cada push no branch de desenvolvimento e ao criar uma tag "v*",
+# quando o resultado também vai para a release.
+on:
+  push:
+    branches: [claude/new-session-ymvhgj, main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Compilar a interface
+        working-directory: frontend
+        env:
+          STATIC_EXPORT: "1"
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.11.1
+
+      - name: Empacotar
+        working-directory: backend
+        run: pyinstaller --noconfirm ortomosaico.spec
+
+      - name: Compactar
+        working-directory: backend/dist
+        run: Compress-Archive -Path Ortomosaico -DestinationPath Ortomosaico-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ortomosaico-windows
+          path: backend/dist/Ortomosaico-windows.zip
+
+      - name: Publicar na release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: backend/dist/Ortomosaico-windows.zip

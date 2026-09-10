@@ -52,7 +52,7 @@ export default function DashboardPage() {
         <div className="card" style={{ marginBottom: 18 }}>
           <h3>Em execução</h3>
           {stats.active_jobs.map((job) => (
-            <Link key={job.id} href={`/projects/${job.project_id}`}>
+            <Link key={job.id} href={`/project?id=${job.project_id}`}>
               <div style={{ margin: "10px 0" }}>
                 <div className="row" style={{ marginBottom: 6 }}>
                   <span>{job.stage_label || "Preparando"}</span>
@@ -84,7 +84,7 @@ export default function DashboardPage() {
             {stats?.recent_projects?.length ? (
               stats.recent_projects.map((project) => (
                 <tr key={project.id}>
-                  <td><Link href={`/projects/${project.id}`}>{project.name}</Link></td>
+                  <td><Link href={`/project?id=${project.id}`}>{project.name}</Link></td>
                   <td>
                     <span className={`badge ${project.status === "completed" ? "ok"
                       : project.status === "processing" ? "run"
