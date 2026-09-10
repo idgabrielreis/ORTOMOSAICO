@@ -46,6 +46,17 @@ DSM_GSD_FACTOR = 8
 NEIGHBORS_PER_IMAGE = 12          # padrão de pares por imagem; o preset de qualidade ajusta
 DSM_SMOOTH_ITERATIONS = 2
 
+# Acima disso o modelo não bate com as posições do drone e o produto não presta.
+MAX_GEOREFERENCE_RMS_M = 60.0
+
+
+def _factory_calibration(images: list[ImageRef]) -> dict | None:
+    """Calibração gravada pelo fabricante, quando a maioria das fotos a traz."""
+    found = [image.calibration for image in images if image.calibration]
+    if len(found) < max(1, len(images) // 2):
+        return None
+    return found[0]
+
 
 def _focal_in_pixels(images: list[ImageRef]) -> float | None:
     """Focal em pixels a partir do EXIF: f_px = f_mm * largura_px / sensor_mm."""
@@ -150,6 +161,94 @@ def _build_dsm(
         surface = cv2.GaussianBlur(surface, (5, 5), 0)
     surface = np.where(valid, dsm, surface).astype(np.float32)
     return surface, valid
+
+
+def _umeyama(source: np.ndarray, target: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Similaridade que leva `source` em `target` (Umeyama/Kabsch com escala)."""
+    source_mean = source.mean(axis=0)
+    target_mean = target.mean(axis=0)
+    source_centered = source - source_mean
+    target_centered = target - target_mean
+
+    covariance = target_centered.T @ source_centered / len(source)
+    u, singular, vt = np.linalg.svd(covariance)
+    correction = np.eye(3)
+    if np.linalg.det(u) * np.linalg.det(vt) < 0:
+        correction[2, 2] = -1.0  # evita solução com reflexão
+    rotation = u @ correction @ vt
+    variance = (source_centered**2).sum() / len(source)
+    scale = float((singular * np.diag(correction)).sum() / variance) if variance > 0 else 1.0
+    translation = target_mean - scale * rotation @ source_mean
+    return scale, rotation, translation
+
+
+def _viewing_direction(yaw_deg: float | None, pitch_deg: float | None) -> np.ndarray | None:
+    """Direção para onde a câmera aponta, em ENU, a partir do gimbal.
+
+    Yaw é o azimute (horário a partir do norte) e pitch é negativo abaixo do
+    horizonte, como a DJI grava no XMP.
+    """
+    if yaw_deg is None or pitch_deg is None:
+        return None
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+    return np.array(
+        [math.cos(pitch) * math.sin(yaw), math.cos(pitch) * math.cos(yaw), math.sin(pitch)],
+        dtype=np.float64,
+    )
+
+
+def _align_using_orientation(
+    reconstruction, names: list[str], targets: np.ndarray,
+    images: dict[str, ImageRef], distance: float,
+):
+    """Georreferencia usando posição E orientação das fotografias.
+
+    Quando as câmeras estão quase em linha reta — uma única faixa de voo, ou um
+    trecho curto — a posição sozinha não define a rotação do modelo: sobra a
+    liberdade de girar em torno do eixo do voo. A orientação do gimbal remove
+    essa ambiguidade. Cada foto contribui com um segundo ponto, deslocado na
+    direção para onde a câmera aponta, no modelo e no mundo real.
+    """
+    import pycolmap
+
+    by_name = {image.name: image for image in reconstruction.images.values()}
+    source_points: list[np.ndarray] = []
+    target_points: list[np.ndarray] = []
+    used_orientation = 0
+
+    for index, name in enumerate(names):
+        colmap_image = by_name.get(name)
+        reference = images.get(name)
+        if colmap_image is None:
+            continue
+        center = np.asarray(colmap_image.projection_center(), dtype=np.float64)
+        source_points.append(center)
+        target_points.append(targets[index])
+
+        direction = _viewing_direction(
+            reference.yaw if reference else None, reference.pitch if reference else None
+        )
+        if direction is None:
+            continue
+        # Eixo óptico da câmera no modelo: terceira linha da rotação mundo->câmera.
+        model_direction = colmap_image.cam_from_world().matrix()[2, :3]
+        norm = np.linalg.norm(model_direction)
+        if norm < 1e-9:
+            continue
+        source_points.append(center + model_direction / norm * distance)
+        target_points.append(targets[index] + direction * distance)
+        used_orientation += 1
+
+    if len(source_points) < 3:
+        return None, 0
+    scale, rotation, translation = _umeyama(
+        np.array(source_points), np.array(target_points)
+    )
+    if not np.isfinite(scale) or scale <= 0:
+        return None, used_orientation
+    # Sim3d aplica x' = escala · R · x + t, então a translação entra como está.
+    return pycolmap.Sim3d(scale, pycolmap.Rotation3d(rotation), translation), used_orientation
 
 
 class _ImageCache:
@@ -331,8 +430,8 @@ class SfmEngine:
         preset = quality_preset(ctx.options.get("quality"))
         ctx.log(f"qualidade: {preset['label']} — {preset['summary']}")
         images = _usable(ctx.images)
-        if len(images) < 5:
-            raise EngineUnavailable("o motor sfm precisa de ao menos 5 imagens com GPS")
+        if len(images) < 3:
+            raise EngineUnavailable("o motor sfm precisa de ao menos 3 fotografias com posição")
         skipped = len(ctx.images) - len(images)
         if skipped:
             warnings.append(f"{skipped} imagens sem GPS ficaram de fora do alinhamento")
@@ -360,9 +459,23 @@ class SfmEngine:
         # errada (e, por consequência, MDS e GSD errados). A focal da câmera do
         # drone é conhecida e confiável, então ela entra como parâmetro fixo.
         reader = pycolmap.ImageReaderOptions()
-        focal_px = _focal_in_pixels(images)
         camera_mode = pycolmap.CameraMode.AUTO
-        if focal_px:
+        calibration = _factory_calibration(images)
+        focal_px = calibration["fx"] if calibration else _focal_in_pixels(images)
+        if calibration:
+            # Calibração de fábrica: focal, centro óptico e distorção medidos
+            # pelo fabricante. Melhor ponto de partida que qualquer estimativa.
+            reader.camera_model = "OPENCV"
+            reader.camera_params = ",".join(
+                f"{calibration[key]}" for key in ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2")
+            )
+            camera_mode = pycolmap.CameraMode.SINGLE
+            ctx.log(
+                f"calibração de fábrica da lente: f={calibration['fx']:.1f} px, "
+                f"centro ({calibration['cx']:.1f}, {calibration['cy']:.1f}), "
+                f"k1={calibration['k1']:.4f}"
+            )
+        elif focal_px:
             reference = next(
                 image for image in images if image.width and image.focal_length_mm
             )
@@ -425,10 +538,21 @@ class SfmEngine:
             )
 
         mapper_options = pycolmap.IncrementalPipelineOptions()
-        mapper_options.min_model_size = max(5, len(names) // 10)
+        # O modelo mínimo nunca pode passar do número de fotos disponíveis,
+        # senão o COLMAP descarta a reconstrução que acabou de montar.
+        mapper_options.min_model_size = max(3, min(len(names), len(names) // 10))
+        # O padrão do COLMAP (16°) foi pensado para fotos ao redor de um objeto.
+        # Em voo de mapeamento a base entre fotos consecutivas é pequena diante
+        # da altura de voo: 8 m de deslocamento a 120 m de altura dão cerca de
+        # 4°. Com o limite padrão o par inicial nunca é aceito e a reconstrução
+        # nem começa.
+        mapper_options.mapper.init_min_tri_angle = 2.0
         if focal_px:
+            # Com a intrínseca conhecida, deixar o bundle adjustment mexer nela
+            # reintroduz a ambiguidade entre focal e profundidade da cena.
             mapper_options.ba_refine_focal_length = False
             mapper_options.ba_refine_principal_point = False
+            mapper_options.ba_refine_extra_params = bool(calibration is None)
         reconstructions = pycolmap.incremental_mapping(
             database_path=database,
             image_path=image_dir,
@@ -462,8 +586,26 @@ class SfmEngine:
             reconstruction, registered_names, target, 3, pycolmap.RANSACOptions()
         )
         if transform is None:
+            # RANSAC precisa de posições bem distribuídas. Em uma faixa única ou
+            # trecho curto elas ficam quase colineares e a rotação em torno do
+            # eixo do voo fica indefinida; a orientação do gimbal resolve isso.
+            by_name_ref = {image.name: image for image in images}
+            altitudes = [
+                image.relative_altitude for image in images if image.relative_altitude
+            ]
+            distance = statistics.fmean(altitudes) if altitudes else 100.0
+            transform, used = _align_using_orientation(
+                reconstruction, registered_names, target, by_name_ref, distance
+            )
+            if transform is not None:
+                warnings.append(
+                    "posições das câmeras quase colineares: o georreferenciamento usou também "
+                    f"a orientação do gimbal de {used} fotografias. Com uma única faixa de voo "
+                    "a orientação do modelo é menos confiável do que com faixas cruzadas"
+                )
+        if transform is None:
             raise EngineUnavailable(
-                "não foi possível alinhar a reconstrução às coordenadas GPS das fotos"
+                "não foi possível alinhar a reconstrução às posições das fotografias"
             )
         reconstruction.transform(transform)
 
@@ -475,6 +617,23 @@ class SfmEngine:
             residuals.append(float(np.linalg.norm(center - np.array(locations[image.name]))))
         rms = round(math.sqrt(sum(r**2 for r in residuals) / len(residuals)), 3) if residuals else None
         ctx.log(f"resíduo das posições das câmeras: RMS {rms} m")
+        if rms is not None and rms > MAX_GEOREFERENCE_RMS_M:
+            # Melhor falhar do que gravar um GeoTIFF no lugar errado: um produto
+            # georreferenciado com erro grosseiro é pior que produto nenhum.
+            raise EngineUnavailable(
+                f"georreferenciamento inconsistente: as posições calculadas ficaram a "
+                f"{rms:.0f} m das posições das fotografias. Verifique se as fotos são do "
+                "mesmo voo e se têm sobreposição suficiente"
+            )
+        if rms is not None and rms > 5 * (
+            statistics.fmean(
+                [image.horizontal_accuracy_m for image in images if image.horizontal_accuracy_m]
+                or [2.0]
+            )
+        ):
+            warnings.append(
+                f"resíduo de {rms:.1f} m entre as posições calculadas e as gravadas pelo drone"
+            )
 
         # ------------------------------------------------------------------ MDS
         ctx.progress(6, 0.2, "Reconstruindo a superfície (MDS)")

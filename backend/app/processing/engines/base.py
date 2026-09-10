@@ -29,6 +29,10 @@ class ImageRef:
     focal_length_mm: float | None = None
     sensor_width_mm: float | None = None
     band: str | None = None
+    # Calibração de fábrica da lente (fx, fy, cx, cy, k1, k2, p1, p2, k3),
+    # quando o fabricante a grava no XMP.
+    calibration: dict | None = None
+    horizontal_accuracy_m: float | None = None
 
 
 @dataclass

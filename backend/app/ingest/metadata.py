@@ -138,8 +138,11 @@ def sensor_width(model: str | None, exif: dict[str, Any], width_px: int | None) 
     return None
 
 
-# RtkFlag da DJI: 0 sem correção, 16 float, 34/50 fixed (varia por firmware).
-RTK_FIXED_FLAGS = {"16", "34", "50"}
+# RtkFlag da DJI: 50 fixed, 34 float, 16 single, 0 sem solução. Só a solução
+# fixa merece ser tratada como posicionamento de precisão; as demais têm
+# incerteza de metros, como se vê nos desvios padrão do próprio arquivo.
+RTK_FIXED_FLAGS = {"50"}
+RTK_FLOAT_FLAGS = {"34"}
 
 
 def _positioning(xmp: dict[str, str], lat: float | None, lon: float | None) -> dict[str, Any]:
@@ -164,11 +167,44 @@ def _positioning(xmp: dict[str, str], lat: float | None, lon: float | None) -> d
     elif std_lat is not None or std_lon is not None:
         horizontal = std_lat if std_lat is not None else std_lon
 
-    is_rtk = flag in RTK_FIXED_FLAGS or (horizontal is not None and horizontal < 0.5)
+    is_rtk = (
+        flag in RTK_FIXED_FLAGS
+        or (flag in RTK_FLOAT_FLAGS and horizontal is not None and horizontal < 0.5)
+        or (horizontal is not None and horizontal < 0.10)
+    )
     return {
         "position_source": "rtk" if is_rtk else "exif_gps",
         "horizontal_accuracy_m": horizontal,
         "vertical_accuracy_m": std_hgt,
+    }
+
+
+def parse_dewarp(xmp: dict[str, str], width: int | None, height: int | None) -> dict | None:
+    """Calibração de fábrica da lente, gravada pela DJI no campo DewarpData.
+
+    O formato é `data;fx,fy,cx,cy,k1,k2,p1,p2,k3`, com fx/fy em pixels e cx/cy
+    como deslocamento em relação ao centro da imagem. É a calibração que o
+    fabricante mediu para aquela unidade: usá-la como ponto de partida do
+    bundle adjustment é bem melhor do que estimar focal e distorção do zero, e
+    evita a ambiguidade entre focal e profundidade em voos sobre terreno plano.
+    """
+    raw = xmp.get("DewarpData")
+    if not raw or not width or not height:
+        return None
+    _, _, values = raw.partition(";")
+    parts = [part.strip() for part in values.split(",") if part.strip()]
+    if len(parts) < 9:
+        return None
+    try:
+        fx, fy, cx_offset, cy_offset, k1, k2, p1, p2, k3 = (float(v) for v in parts[:9])
+    except ValueError:
+        return None
+    if fx <= 0 or fy <= 0:
+        return None
+    return {
+        "fx": fx, "fy": fy,
+        "cx": width / 2 + cx_offset, "cy": height / 2 + cy_offset,
+        "k1": k1, "k2": k2, "p1": p1, "p2": p2, "k3": k3,
     }
 
 
@@ -227,6 +263,20 @@ def read_metadata(path: Path | str) -> dict[str, Any]:
     meta["rtk_flag"] = xmp.get("RtkFlag")
     meta.update(_positioning(xmp, lat, lon))
     meta["band"] = detect_band(path.name, xmp)
+
+    calibration = parse_dewarp(xmp, meta.get("width"), meta.get("height"))
+    if calibration is None:
+        focal_px = _to_float(xmp.get("CalibratedFocalLength"))
+        center_x = _to_float(xmp.get("CalibratedOpticalCenterX"))
+        center_y = _to_float(xmp.get("CalibratedOpticalCenterY"))
+        if focal_px and meta.get("width"):
+            calibration = {
+                "fx": focal_px, "fy": focal_px,
+                "cx": center_x if center_x is not None else meta["width"] / 2,
+                "cy": center_y if center_y is not None else (meta.get("height") or 0) / 2,
+                "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+            }
+    meta["calibration"] = calibration
 
     meta["extra"] = {
         k: v for k, v in xmp.items()

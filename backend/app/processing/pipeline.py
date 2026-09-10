@@ -125,6 +125,8 @@ def _flatten_dataset(images: list[Image], target_dir: Path, log) -> list[ImageRe
                 relative_altitude=img.relative_altitude, yaw=img.yaw, pitch=img.pitch,
                 width=img.width, height=img.height, focal_length_mm=img.focal_length_mm,
                 sensor_width_mm=img.sensor_width_mm, band=img.band,
+                calibration=(img.extra or {}).get("calibration"),
+                horizontal_accuracy_m=img.horizontal_accuracy_m,
             )
         )
     log(f"dataset achatado: {len(refs)} imagens em {target_dir}")

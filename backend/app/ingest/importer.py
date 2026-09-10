@@ -114,7 +114,10 @@ def import_flight(
                     position_source=meta.get("position_source") or "none",
                     horizontal_accuracy_m=meta.get("horizontal_accuracy_m"),
                     vertical_accuracy_m=meta.get("vertical_accuracy_m"),
-                    extra=meta.get("extra") or {},
+                    extra={
+                        **(meta.get("extra") or {}),
+                        **({"calibration": meta["calibration"]} if meta.get("calibration") else {}),
+                    },
                 )
             )
             if len(batch) >= BATCH_SIZE:
