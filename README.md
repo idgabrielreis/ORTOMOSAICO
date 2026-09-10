@@ -79,7 +79,20 @@ qual motor está em uso e por quê.
 docker compose up -d   # api, worker, redis, PostGIS, NodeODM e web
 ```
 
-Monte o disco das imagens em `./data` e os produtos sairão em `./storage`.
+Depois abra <http://localhost:3000>.
+
+As fotos ficam disponíveis para o app pelo volume `./data`, montado somente
+para leitura, e os produtos saem em `./storage`. Para apontar para outro disco,
+troque a linha do volume nos serviços `api` e `worker` do `docker-compose.yml`:
+
+```yaml
+    volumes:
+      - ./storage:/storage
+      - "I:/FALTA PROCESSAR:/data:ro"    # Windows
+      - /mnt/dados/voos:/data:ro          # Linux
+```
+
+Dentro do app, as pastas aparecem sob `/data`.
 
 ### Dados de exemplo
 
