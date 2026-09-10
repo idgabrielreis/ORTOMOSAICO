@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import statistics
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -29,9 +30,20 @@ import numpy as np
 from ...geo.crs import from_utm, to_utm, utm_epsg
 from .base import EngineContext, EngineResult, EngineUnavailable, ImageRef
 
-MAX_OUTPUT_PIXELS = 60_000_000
+# O ortomosaico sai no GSD nativo do voo. Não existe teto de resolução: um voo
+# de 100 ha a 2,5 cm/px passa de 1,6 gigapixel, e reduzir isso jogaria fora
+# justamente o detalhe que o drone capturou. O que torna esse tamanho viável é
+# processar a saída em blocos, nunca com o mosaico inteiro em memória.
+ORTHO_TILE = 2048                 # lado do bloco de saída, em pixels
+IMAGE_CACHE_SIZE = 12             # fotos decodificadas mantidas em memória
+SAFETY_MAX_PIXELS = 8_000_000_000 # guarda contra parâmetro absurdo (não é limite de qualidade)
+
+# O MDS não precisa da resolução do ortomosaico: a nuvem esparsa não tem
+# densidade para isso, e uma grade mais grossa é mais estável e muito mais leve.
+DSM_GSD_FACTOR = 8
+
 NEIGHBORS_PER_IMAGE = 12          # pares candidatos por imagem, escolhidos por GPS
-MAX_FEATURE_IMAGE_SIZE = 2400     # lado máximo usado na extração de features
+MAX_FEATURE_IMAGE_SIZE = 2400     # só para detectar features; não afeta a saída
 DSM_SMOOTH_ITERATIONS = 2
 
 
@@ -140,6 +152,158 @@ def _build_dsm(
     return surface, valid
 
 
+class _ImageCache:
+    """Cache das fotos decodificadas.
+
+    Blocos vizinhos do ortomosaico são cobertos pelas mesmas fotos; decodificar
+    de novo a cada bloco dominaria o tempo de processamento. O cache é pequeno
+    e limitado por número de imagens, para o pico de memória não depender do
+    tamanho do voo.
+    """
+
+    def __init__(self, max_items: int):
+        from collections import OrderedDict
+
+        self.max_items = max_items
+        self._items: OrderedDict[str, object] = OrderedDict()
+
+    def get(self, key: str, path):
+        import cv2
+
+        if key in self._items:
+            self._items.move_to_end(key)
+            return self._items[key]
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            return None
+        self._items[key] = image
+        if len(self._items) > self.max_items:
+            self._items.popitem(last=False)
+        return image
+
+
+def _sample_surface(
+    surface: np.ndarray, minx: float, maxy: float, gsd: float,
+    grid_x: np.ndarray, grid_y: np.ndarray,
+) -> np.ndarray:
+    """Amostra o MDS (grade grossa) nas coordenadas do bloco do ortomosaico."""
+    import cv2
+
+    columns = np.clip((grid_x - minx) / gsd - 0.5, 0, surface.shape[1] - 1).astype(np.float32)
+    rows = np.clip((maxy - grid_y) / gsd - 0.5, 0, surface.shape[0] - 1).astype(np.float32)
+    return cv2.remap(
+        surface, columns, rows, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+    ).astype(np.float64)
+
+
+@dataclass
+class _View:
+    """Uma fotografia alinhada, com a pose e o modelo de câmera do COLMAP."""
+
+    name: str
+    path: Path
+    camera: object
+    cam_from_world: np.ndarray
+    center: np.ndarray
+    west: float = 0.0
+    south: float = 0.0
+    east: float = 0.0
+    north: float = 0.0
+
+    def compute_extent(self, z_reference: float, z_min: float, z_max: float) -> None:
+        """Área do solo que esta foto pode enxergar.
+
+        Os quatro cantos da imagem são traçados como raios e intersectados com
+        os planos de menor e maior cota do modelo; a envoltória disso é o
+        retângulo usado para decidir quais fotos entram em cada bloco.
+        """
+        rotation = self.cam_from_world[:, :3]
+        corners = np.array(
+            [[0, 0], [self.camera.width, 0],
+             [self.camera.width, self.camera.height], [0, self.camera.height]],
+            dtype=np.float64,
+        )
+        rays = np.asarray(self.camera.cam_ray_from_img(corners), dtype=np.float64)
+        directions = rays @ rotation  # equivale a R.T @ ray, por linha
+
+        points = []
+        for plane_z in (z_min - 5.0, z_reference, z_max + 5.0):
+            for direction in directions:
+                if abs(direction[2]) < 1e-9:
+                    continue
+                scale = (plane_z - self.center[2]) / direction[2]
+                if scale <= 0:
+                    continue
+                points.append(self.center + direction * scale)
+        if not points:
+            self.west = self.south = self.east = self.north = 0.0
+            return
+        array = np.array(points)
+        self.west, self.east = float(array[:, 0].min()), float(array[:, 0].max())
+        self.south, self.north = float(array[:, 1].min()), float(array[:, 1].max())
+
+    def intersects(self, west: float, south: float, east: float, north: float) -> bool:
+        return not (
+            self.east < west or self.west > east or self.north < south or self.south > north
+        )
+
+    def sample(
+        self, world: np.ndarray, shape: tuple[int, int], cache: _ImageCache
+    ) -> tuple[np.ndarray | None, np.ndarray]:
+        """Projeta os pontos do bloco nesta foto e devolve cor e peso.
+
+        Esta é a ortorretificação propriamente dita: cada célula do terreno é
+        levada ao pixel correspondente da fotografia pela pose estimada, o que
+        corrige o deslocamento causado pelo relevo.
+        """
+        import cv2
+
+        source = cache.get(self.name, self.path)
+        if source is None:
+            return None, np.zeros(shape, dtype=np.float32)
+
+        scale_x = source.shape[1] / self.camera.width
+        scale_y = source.shape[0] / self.camera.height
+        rotation = self.cam_from_world[:, :3]
+        translation = self.cam_from_world[:, 3]
+
+        in_camera = world @ rotation.T + translation
+        visible = in_camera[:, 2] > 1e-6
+        if not visible.any():
+            return None, np.zeros(shape, dtype=np.float32)
+
+        projected = np.full((world.shape[0], 2), -1.0, dtype=np.float64)
+        projected[visible] = self.camera.img_from_cam(in_camera[visible])
+        px = projected[:, 0] * scale_x
+        py = projected[:, 1] * scale_y
+        inside = (
+            visible
+            & (px >= 0) & (px < source.shape[1] - 1)
+            & (py >= 0) & (py < source.shape[0] - 1)
+        )
+        if not inside.any():
+            return None, np.zeros(shape, dtype=np.float32)
+
+        map_x = np.where(inside, px, -1).astype(np.float32).reshape(shape)
+        map_y = np.where(inside, py, -1).astype(np.float32).reshape(shape)
+        sampled = cv2.remap(
+            source, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
+        ).astype(np.float32)
+
+        # Peso maior no centro da foto: menos distorção, visada mais próxima da
+        # vertical e menos deslocamento por relevo. É o que define a seamline.
+        center_x = self.camera.principal_point_x * scale_x
+        center_y = self.camera.principal_point_y * scale_y
+        normalized = np.sqrt(
+            ((px - center_x) / (source.shape[1] / 2)) ** 2
+            + ((py - center_y) / (source.shape[0] / 2)) ** 2
+        )
+        weight = np.clip(1.15 - normalized, 0.0, 1.0) ** 2
+        weight = np.where(inside, weight, 0.0).astype(np.float32).reshape(shape)
+        return sampled, weight
+
+
 class SfmEngine:
     name = "sfm"
     description = "COLMAP (pycolmap): SfM, bundle adjustment, MDS esparso e ortorretificação"
@@ -157,9 +321,10 @@ class SfmEngine:
         return True, "pronto (CPU)"
 
     def run(self, ctx: EngineContext) -> EngineResult:
-        import cv2
+        import cv2  # noqa: F401  (usado pelos auxiliares deste módulo)
         import pycolmap
         import rasterio
+        import rasterio.windows  # noqa: F401
         from rasterio.transform import from_origin
 
         warnings: list[str] = []
@@ -338,152 +503,164 @@ class SfmEngine:
         miny, maxy = float(points[:, 1].min()), float(points[:, 1].max())
         width = int(math.ceil((maxx - minx) / gsd))
         height = int(math.ceil((maxy - miny) / gsd))
-        if width * height > MAX_OUTPUT_PIXELS:
-            factor = math.sqrt(width * height / MAX_OUTPUT_PIXELS)
+        if width * height > SAFETY_MAX_PIXELS:
+            factor = math.sqrt(width * height / SAFETY_MAX_PIXELS)
             gsd *= factor
             width = int(math.ceil((maxx - minx) / gsd))
             height = int(math.ceil((maxy - miny) / gsd))
-            warnings.append(f"GSD ajustado para {gsd * 100:.1f} cm/px pelo tamanho do produto")
-        ctx.log(f"grade {width}x{height}, GSD {gsd * 100:.2f} cm/px, EPSG:{epsg}")
+            warnings.append(
+                f"GSD ajustado para {gsd * 100:.2f} cm/px: o pedido excedia o limite de "
+                "segurança de 8 gigapixels"
+            )
+        ctx.log(
+            f"ortomosaico {width}x{height} px ({width * height / 1e6:.0f} MP), "
+            f"GSD {gsd * 100:.2f} cm/px, EPSG:{epsg}"
+        )
 
-        surface, dsm_valid = _build_dsm(points, minx, maxy, gsd, width, height)
+        # ------------------------------------------------------------------ MDS
+        dsm_gsd = float(ctx.options.get("dsm_gsd_m") or gsd * DSM_GSD_FACTOR)
+        dsm_width = max(2, int(math.ceil((maxx - minx) / dsm_gsd)))
+        dsm_height = max(2, int(math.ceil((maxy - miny) / dsm_gsd)))
+        surface, dsm_valid = _build_dsm(points, minx, maxy, dsm_gsd, dsm_width, dsm_height)
+        ctx.log(f"MDS {dsm_width}x{dsm_height} px, GSD {dsm_gsd * 100:.1f} cm/px")
         ctx.progress(6, 0.9, "MDS gerado")
 
-        # -------------------------------------------------- ortorretificação
+        # ---------------------------------------------- geometria das câmeras
         ctx.progress(7, 0.02, "Ortorretificando as fotografias")
-        xs = minx + (np.arange(width, dtype=np.float64) + 0.5) * gsd
-        ys = maxy - (np.arange(height, dtype=np.float64) + 0.5) * gsd
-
-        accumulator = np.zeros((height, width, 3), dtype=np.float32)
-        weights = np.zeros((height, width), dtype=np.float32)
         by_name = {image.name: image for image in ctx.images}
-        total = reconstruction.num_reg_images()
-
-        for index, colmap_image in enumerate(reconstruction.images.values(), start=1):
-            if ctx.is_canceled():
-                raise InterruptedError("cancelado pelo usuário")
+        views: list[_View] = []
+        elevation_reference = float(np.median(points[:, 2]))
+        for colmap_image in reconstruction.images.values():
             reference = by_name.get(colmap_image.name)
             if reference is None:
                 continue
-            source = cv2.imread(str(reference.path), cv2.IMREAD_COLOR)
-            if source is None:
-                warnings.append(f"não foi possível decodificar {colmap_image.name}")
-                continue
-
             camera = reconstruction.cameras[colmap_image.camera_id]
-            scale_x = source.shape[1] / camera.width
-            scale_y = source.shape[0] / camera.height
-            cam_from_world = colmap_image.cam_from_world().matrix()
-            rotation = cam_from_world[:, :3]
-            translation = cam_from_world[:, 3]
-            center = np.asarray(colmap_image.projection_center(), dtype=np.float64)
-
-            # Recorte da grade que a foto pode enxergar, para não projetar o
-            # mosaico inteiro a cada imagem.
-            radius = flight_height * max(camera.width, camera.height) / (
-                2 * camera.mean_focal_length()
-            ) * 1.4
-            col0 = max(0, int((center[0] - radius - minx) / gsd))
-            col1 = min(width, int((center[0] + radius - minx) / gsd) + 1)
-            row0 = max(0, int((maxy - center[1] - radius) / gsd))
-            row1 = min(height, int((maxy - center[1] + radius) / gsd) + 1)
-            if col1 <= col0 or row1 <= row0:
-                continue
-
-            grid_x, grid_y = np.meshgrid(xs[col0:col1], ys[row0:row1])
-            grid_z = surface[row0:row1, col0:col1]
-            world = np.stack([grid_x, grid_y, grid_z], axis=-1).reshape(-1, 3)
-
-            in_camera = world @ rotation.T + translation
-            depth = in_camera[:, 2]
-            visible = depth > 1e-6
-            if not visible.any():
-                continue
-
-            projected = np.full((world.shape[0], 2), -1.0, dtype=np.float64)
-            projected[visible] = camera.img_from_cam(in_camera[visible])
-            px = projected[:, 0] * scale_x
-            py = projected[:, 1] * scale_y
-            inside = (
-                visible
-                & (px >= 0) & (px < source.shape[1] - 1)
-                & (py >= 0) & (py < source.shape[0] - 1)
+            view = _View(
+                name=colmap_image.name,
+                path=reference.path,
+                camera=camera,
+                cam_from_world=colmap_image.cam_from_world().matrix(),
+                center=np.asarray(colmap_image.projection_center(), dtype=np.float64),
             )
-            if not inside.any():
-                continue
+            view.compute_extent(elevation_reference, float(points[:, 2].min()),
+                                float(points[:, 2].max()))
+            views.append(view)
+        if not views:
+            raise EngineUnavailable("nenhuma fotografia alinhada pôde ser ortorretificada")
 
-            patch_shape = (row1 - row0, col1 - col0)
-            map_x = np.where(inside, px, -1).astype(np.float32).reshape(patch_shape)
-            map_y = np.where(inside, py, -1).astype(np.float32).reshape(patch_shape)
-            sampled = cv2.remap(
-                source, map_x, map_y, interpolation=cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
-            ).astype(np.float32)
+        cache = _ImageCache(IMAGE_CACHE_SIZE)
+        coverage_pixels = 0
+        total_pixels = width * height
 
-            # Peso: prioriza o centro da foto (menos distorção, visada mais
-            # próxima da vertical) e descarta as bordas, onde o relevo desloca mais.
-            center_x = camera.principal_point_x * scale_x
-            center_y = camera.principal_point_y * scale_y
-            normalized = np.sqrt(
-                ((px - center_x) / (source.shape[1] / 2)) ** 2
-                + ((py - center_y) / (source.shape[0] / 2)) ** 2
-            )
-            weight = np.clip(1.15 - normalized, 0.0, 1.0) ** 2
-            weight = np.where(inside, weight, 0.0).astype(np.float32).reshape(patch_shape)
-
-            accumulator[row0:row1, col0:col1] += sampled * weight[..., None]
-            weights[row0:row1, col0:col1] += weight
-
-            if index % 5 == 0 or index == total:
-                ctx.progress(7, index / max(total, 1), f"Ortorretificando ({index}/{total})")
-
-        covered = weights > 1e-3
-        if not covered.any():
-            raise EngineUnavailable("nenhuma fotografia pôde ser ortorretificada")
-
-        rgb = np.zeros_like(accumulator)
-        np.divide(accumulator, weights[..., None], out=rgb, where=covered[..., None])
-        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-        alpha = (covered * 255).astype(np.uint8)
-
-        # ----------------------------------------------------------- gravação
-        ctx.progress(8, 0.3, "Escrevendo GeoTIFF do ortomosaico e do MDS")
+        # ------------------------------------------- gravação em blocos
         ctx.output_dir.mkdir(parents=True, exist_ok=True)
         transform_affine = from_origin(minx, maxy, gsd, gsd)
         ortho_path = ctx.output_dir / "orthomosaic.tif"
+        tiles_x = math.ceil(width / ORTHO_TILE)
+        tiles_y = math.ceil(height / ORTHO_TILE)
+        tiles_total = tiles_x * tiles_y
+
         with rasterio.open(
             ortho_path, "w", driver="GTiff", height=height, width=width, count=4,
             dtype="uint8", crs=f"EPSG:{epsg}", transform=transform_affine,
             compress="deflate", predictor=2, tiled=True, blockxsize=512, blockysize=512,
-            BIGTIFF="IF_SAFER",
+            BIGTIFF="YES", num_threads="ALL_CPUS",
         ) as dst:
-            dst.write(rgb[:, :, 2], 1)
-            dst.write(rgb[:, :, 1], 2)
-            dst.write(rgb[:, :, 0], 3)
-            dst.write(alpha, 4)
             dst.colorinterp = [
                 rasterio.enums.ColorInterp.red, rasterio.enums.ColorInterp.green,
                 rasterio.enums.ColorInterp.blue, rasterio.enums.ColorInterp.alpha,
             ]
-            dst.build_overviews([2, 4, 8, 16], rasterio.enums.Resampling.average)
-            dst.update_tags(ORTOMOSAICO_ENGINE="sfm", ORTOMOSAICO_GSD_CM=f"{gsd * 100:.2f}")
+            dst.update_tags(
+                ORTOMOSAICO_ENGINE="sfm", ORTOMOSAICO_GSD_CM=f"{gsd * 100:.2f}",
+                ORTOMOSAICO_IMAGES=str(len(views)),
+            )
+
+            done = 0
+            for tile_row in range(tiles_y):
+                for tile_col in range(tiles_x):
+                    if ctx.is_canceled():
+                        raise InterruptedError("cancelado pelo usuário")
+                    row0 = tile_row * ORTHO_TILE
+                    col0 = tile_col * ORTHO_TILE
+                    tile_h = min(ORTHO_TILE, height - row0)
+                    tile_w = min(ORTHO_TILE, width - col0)
+
+                    west_tile = minx + col0 * gsd
+                    east_tile = west_tile + tile_w * gsd
+                    north_tile = maxy - row0 * gsd
+                    south_tile = north_tile - tile_h * gsd
+
+                    visible = [
+                        view for view in views
+                        if view.intersects(west_tile, south_tile, east_tile, north_tile)
+                    ]
+                    done += 1
+                    if not visible:
+                        continue
+
+                    grid_x, grid_y = np.meshgrid(
+                        west_tile + (np.arange(tile_w, dtype=np.float64) + 0.5) * gsd,
+                        north_tile - (np.arange(tile_h, dtype=np.float64) + 0.5) * gsd,
+                    )
+                    grid_z = _sample_surface(surface, minx, maxy, dsm_gsd, grid_x, grid_y)
+                    world = np.stack([grid_x, grid_y, grid_z], axis=-1).reshape(-1, 3)
+
+                    accumulator = np.zeros((tile_h, tile_w, 3), dtype=np.float32)
+                    weights = np.zeros((tile_h, tile_w), dtype=np.float32)
+                    for view in visible:
+                        sampled, weight = view.sample(world, (tile_h, tile_w), cache)
+                        if sampled is None:
+                            continue
+                        accumulator += sampled * weight[..., None]
+                        weights += weight
+
+                    covered = weights > 1e-3
+                    if not covered.any():
+                        continue
+                    coverage_pixels += int(covered.sum())
+
+                    rgb = np.zeros_like(accumulator)
+                    np.divide(accumulator, weights[..., None], out=rgb, where=covered[..., None])
+                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                    window = rasterio.windows.Window(col0, row0, tile_w, tile_h)
+                    # OpenCV entrega BGR; o GeoTIFF sai em RGB + alfa.
+                    dst.write(rgb[:, :, 2], 1, window=window)
+                    dst.write(rgb[:, :, 1], 2, window=window)
+                    dst.write(rgb[:, :, 0], 3, window=window)
+                    dst.write((covered * 255).astype(np.uint8), 4, window=window)
+
+                    ctx.progress(
+                        7, done / tiles_total,
+                        f"Ortorretificando bloco {done}/{tiles_total} "
+                        f"({len(visible)} fotos)",
+                    )
+
+        if coverage_pixels == 0:
+            raise EngineUnavailable("nenhuma fotografia pôde ser ortorretificada")
+
+        ctx.progress(8, 0.3, "Gerando pirâmides e escrevendo o MDS")
+        with rasterio.open(ortho_path, "r+") as dst:
+            dst.build_overviews([2, 4, 8, 16, 32], rasterio.enums.Resampling.average)
 
         dsm_path = ctx.output_dir / "dsm.tif"
-        # Só publica cota onde há cobertura fotográfica: o preenchimento de
-        # buracos serve para ortorretificar, não para inventar terreno.
-        dsm_output = np.where(covered, surface, np.nan).astype(np.float32)
+        # Só publica cota onde a nuvem tinha pontos: o preenchimento de buracos
+        # serve para ortorretificar, não para inventar terreno.
+        dsm_output = np.where(dsm_valid, surface, np.nan).astype(np.float32)
         with rasterio.open(
-            dsm_path, "w", driver="GTiff", height=height, width=width, count=1,
-            dtype="float32", crs=f"EPSG:{epsg}", transform=transform_affine,
+            dsm_path, "w", driver="GTiff", height=dsm_height, width=dsm_width, count=1,
+            dtype="float32", crs=f"EPSG:{epsg}",
+            transform=from_origin(minx, maxy, dsm_gsd, dsm_gsd),
             nodata=float("nan"), compress="deflate", predictor=3, tiled=True,
             blockxsize=512, blockysize=512, BIGTIFF="IF_SAFER",
         ) as dst:
             dst.write(dsm_output, 1)
-            dst.build_overviews([2, 4, 8, 16], rasterio.enums.Resampling.average)
+            if min(dsm_width, dsm_height) > 256:
+                dst.build_overviews([2, 4, 8], rasterio.enums.Resampling.average)
             dst.update_tags(
                 ORTOMOSAICO_ENGINE="sfm",
                 ORTOMOSAICO_SOURCE="nuvem esparsa do SfM",
                 ORTOMOSAICO_POINTS=str(len(points)),
+                ORTOMOSAICO_GSD_CM=f"{dsm_gsd * 100:.1f}",
             )
 
         cloud_path = ctx.output_dir / "point_cloud.ply"
@@ -492,6 +669,7 @@ class SfmEngine:
         west, south = from_utm(minx, miny, epsg)
         east, north = from_utm(maxx, maxy, epsg)
         elevations = dsm_output[np.isfinite(dsm_output)]
+        coverage_percent = round(coverage_pixels / total_pixels * 100, 1)
         ctx.progress(8, 1.0, "Concluído")
 
         return EngineResult(
@@ -508,7 +686,9 @@ class SfmEngine:
                 "sparse_points": int(len(points)),
                 "gps_rms_m": rms,
                 "canvas_px": [width, height],
-                "coverage_percent": round(float(covered.mean()) * 100, 1),
+                "megapixels": round(width * height / 1e6, 1),
+                "dsm_gsd_cm": round(dsm_gsd * 100, 1),
+                "coverage_percent": coverage_percent,
                 "elevation_min_m": round(float(np.percentile(elevations, 1)), 2)
                 if elevations.size else None,
                 "elevation_max_m": round(float(np.percentile(elevations, 99)), 2)
