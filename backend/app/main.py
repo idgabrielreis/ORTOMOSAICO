@@ -18,7 +18,44 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 async def lifespan(app: FastAPI):
     init_db()
     settings.storage_root.mkdir(parents=True, exist_ok=True)
+    _recover_orphan_jobs()
     yield
+
+
+def _recover_orphan_jobs() -> None:
+    """Fecha jobs que morreram junto com o processo anterior.
+
+    Com a fila local o processamento roda em uma thread da própria API: se o
+    servidor cair no meio, o job fica marcado como em execução para sempre e o
+    projeto trava, sem deixar iniciar outro. Aqui eles são marcados como falha
+    logo na subida, com o motivo explícito.
+    """
+    from datetime import datetime, timezone
+
+    from .db import session_scope
+    from .models import Job, JobStatus, Project, ProjectStatus
+
+    with session_scope() as db:
+        orphans = (
+            db.query(Job)
+            .filter(Job.status.in_([JobStatus.RUNNING, JobStatus.QUEUED]))
+            .all()
+        )
+        for job in orphans:
+            job.status = JobStatus.FAILED
+            job.error = "o processamento foi interrompido pela parada do servidor"
+            job.finished_at = datetime.now(timezone.utc)
+            project = db.get(Project, job.project_id)
+            if project and project.status in (
+                ProjectStatus.PROCESSING, ProjectStatus.SCANNING
+            ):
+                project.status = (
+                    ProjectStatus.READY if job.kind == "orthomosaic" else ProjectStatus.CREATED
+                )
+        if orphans:
+            logging.getLogger(__name__).warning(
+                "%d job(s) interrompidos foram encerrados na inicialização", len(orphans)
+            )
 
 
 app = FastAPI(
